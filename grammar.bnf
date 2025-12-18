@@ -1,0 +1,63 @@
+/* BNF grammar covering queries used in lexer tests */
+
+<program> ::= <statement_list>
+
+<statement_list> ::= <statement>
+                   | <statement> ";" <statement_list>
+
+<statement> ::= <select_stmt>
+             | <insert_stmt>
+             | <create_table_stmt>
+
+/* SELECT statements */
+<select_stmt> ::= "SELECT" <select_list> "FROM" <identifier> [ "WHERE" <where_clause> ] [ "LIMIT" <number> ]
+
+<select_list> ::= "*"
+                | <column_list>
+
+<column_list> ::= <identifier>
+                 | <identifier> "," <column_list>
+
+<where_clause> ::= <expression>
+
+<expression> ::= <identifier> <cmp_op> <literal>
+
+<cmp_op> ::= "=" | "!=" | "<" | ">" | "<=" | ">="
+
+/* INSERT statements */
+<insert_stmt> ::= "INSERT" "INTO" <identifier> "VALUES" "(" <value_list> ")"
+
+<value_list> ::= <literal>
+               | <literal> "," <value_list>
+
+/* CREATE TABLE */
+<create_table_stmt> ::= "CREATE" "TABLE" <identifier> "(" <column_def_list> ")"
+
+<column_def_list> ::= <column_def>
+                    | <column_def> "," <column_def_list>
+
+<column_def> ::= <identifier> <type>
+
+<type> ::= "INT" | "TEXT"
+
+/* Terminals */
+<literal> ::= <number> | <string>
+
+<number> ::= <digit> { <digit> } [ "." { <digit> } ]
+
+<string> ::= "'" <chars> "'" | '"' <chars> '"'
+
+<identifier> ::= <letter> { <letter> | <digit> | "_" }
+
+<digit> ::= "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+
+<letter> ::= "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J" | "K" | "L" | "M" | "N" | "O" | "P" | "Q" | "R" | "S" | "T" | "U" | "V" | "W" | "X" | "Y" | "Z"
+             | "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z"
+
+<chars> ::= /* any sequence of characters except the quote delimiter */
+
+/* Notes:
+ - Keywords in quotes are case-insensitive in the lexer/tests.
+ - Semicolons are used to separate statements; individual statements in tests may include or omit them.
+ - This grammar is intentionally small and focused to cover the constructs exercised by the unit tests.
+*/
