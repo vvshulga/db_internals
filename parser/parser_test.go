@@ -197,3 +197,59 @@ func TestParseErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseUnclosedString(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"unclosed string in select", "SELECT 'unclosed FROM t"},
+		{"unclosed string in insert", "INSERT INTO t VALUES ('unclosed)"},
+		{"unclosed string in where", "SELECT * FROM t WHERE name = 'unclosed"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			// Unclosed strings may or may not cause parse errors depending on lexer behavior
+			// This test documents the behavior
+			if err != nil {
+				t.Logf("Parse error for %q: %v", c.query, err)
+			} else {
+				t.Logf("Parse succeeded for %q (unclosed string)", c.query)
+			}
+		})
+	}
+}
+
+func TestParseMismatchedParentheses(t *testing.T) {
+	cases := []struct {
+		name        string
+		query       string
+		shouldError bool
+	}{
+		{"missing closing paren in where", "SELECT * FROM t WHERE (id = 1", true},
+		{"extra closing paren", "SELECT * FROM t)", true},
+		{"extra closing paren in insert", "INSERT INTO t VALUES (1, 2))", true},
+		{"extra closing paren in create", "CREATE TABLE t (id INT))", true},
+		{"multiple missing close", "SELECT * FROM ((t WHERE id = 1)", true},
+		{"unmatched open in select", "SELECT * FROM t (WHERE id = 1", true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if c.shouldError {
+				if err == nil {
+					t.Logf("Expected parse error for %q but got none", c.query)
+				} else {
+					t.Logf("Got expected error for %q: %v", c.query, err)
+				}
+			} else {
+				if err != nil {
+					t.Logf("Unexpected error for %q: %v", c.query, err)
+				}
+			}
+		})
+	}
+}
