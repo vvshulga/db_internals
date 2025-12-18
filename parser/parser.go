@@ -327,9 +327,16 @@ func (p *parser) parseInsert() (AstNode, error) {
 	}
 	p.next()
 	vals := []Expr{}
+	hasValues := false
 	for {
 		if p.peek() == nil {
 			return nil, fmt.Errorf("unexpected eof in values")
+		}
+		if p.peek().Type == lexer.TokenSeparator && p.peek().Value == ")" {
+			if !hasValues {
+				return nil, fmt.Errorf("expected at least one value in VALUES list")
+			}
+			break
 		}
 		if p.peek().Type == lexer.TokenNumber {
 			v := p.next().Value
@@ -341,12 +348,15 @@ func (p *parser) parseInsert() (AstNode, error) {
 				return nil, err
 			}
 			vals = append(vals, &LiteralInt{Value: u})
+			hasValues = true
 		} else if p.peek().Type == lexer.TokenString {
 			s := p.next().Value
 			vals = append(vals, &LiteralString{Value: s})
+			hasValues = true
 		} else if p.peek().Type == lexer.TokenIdentifier {
 			id := p.next().Value
 			vals = append(vals, &ColumnRef{Name: id})
+			hasValues = true
 		} else {
 			return nil, fmt.Errorf("unexpected token in VALUES: %v", p.peek())
 		}
@@ -379,11 +389,15 @@ func (p *parser) parseCreateTable() (AstNode, error) {
 	}
 	p.next()
 	cols := []ColumnDef{}
+	hasColumns := false
 	for {
 		if p.peek() == nil {
 			return nil, fmt.Errorf("unexpected eof in column definitions")
 		}
 		if p.peek().Type == lexer.TokenSeparator && p.peek().Value == ")" {
+			if !hasColumns {
+				return nil, fmt.Errorf("expected at least one column definition")
+			}
 			p.next()
 			break
 		}
@@ -396,6 +410,7 @@ func (p *parser) parseCreateTable() (AstNode, error) {
 		}
 		typ := p.next().Value
 		cols = append(cols, ColumnDef{Name: name, Type: typ})
+		hasColumns = true
 		if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "," {
 			p.next()
 			continue

@@ -174,3 +174,26 @@ func TestParseASTStructure(t *testing.T) {
 		t.Fatalf("unexpected columns: %+v", ct.Columns)
 	}
 }
+
+func TestParseErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"missing projections", "SELECT FROM t"},
+		{"missing table", "SELECT * FROM"},
+		{"missing where condition", "SELECT * FROM t WHERE"},
+		{"insert missing values list", "INSERT INTO t VALUES"},
+		{"create table empty columns", "CREATE TABLE t()"},
+		{"invalid statement with WHERE", "WHERE"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if err == nil {
+				t.Fatalf("expected parse error for %q but got none", c.query)
+			}
+		})
+	}
+}
