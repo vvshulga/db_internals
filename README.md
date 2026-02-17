@@ -1,398 +1,469 @@
 # db_internals
 
-Education project for DB Internals CS osvita course. This project implements a SQL lexer and parser that tokenizes and builds an Abstract Syntax Tree (AST) for SQL queries.
+Education project for the DB Internals CS osvita course. Implements an OLTP row-store database engine from scratch in Go: SQL lexer + parser, a slotted-page storage layer, and a table-manager API.
+
+---
 
 ## Table of Contents
 
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
 - [Quick Start](#quick-start)
-- [Using the Lexer](#using-the-lexer)
-- [Using the Parser](#using-the-parser)
-- [Using the CLI Tool](#using-the-cli-tool)
-- [Supported SQL](#supported-sql)
+- [Workload Assumptions](#workload-assumptions)
+- [Storage Architecture](#storage-architecture)
+- [On-Disk Layout](#on-disk-layout)
+- [Table Manager API](#table-manager-api)
+- [storage\_cli](#storage_cli)
+- [Demo](#demo)
+- [SQL Frontend](#sql-frontend)
 - [Testing](#testing)
 
-## Prerequisites
+---
 
-### macOS
+## Quick Start
 
-To run this application on macOS, you need:
-
-- **Go 1.25 or later**: [Download Go](https://golang.org/dl/)
-  - Install using Homebrew (recommended):
-    ```bash
-    brew install go
-    ```
-  - Verify installation:
-    ```bash
-    go version
-    ```
-
-- **Git**: [Download Git](https://git-scm.com/) or install via Homebrew:
-  ```bash
-  brew install git
-  ```
-
-### Other Requirements
-
-- A terminal/shell environment (zsh, bash, etc.)
-- Code editor (VS Code, GoLand, etc.) - optional
-
-## Installation
-
-### Clone the Repository
+**Prerequisites**: Go 1.25+
 
 ```bash
 git clone https://github.com/vvshulga/db_internals.git
 cd db_internals
-```
-
-### Download Dependencies
-
-```bash
-go mod download
-```
-
-## Quick Start
-
-### Build the Application
-
-```bash
-go build -o db_internals .
-```
-
-### Run the CLI Tool
-
-```bash
+go test -v -race ./...        # run all tests
+go build -o db_internals .    # build the CLI
 ./db_internals "SELECT * FROM users WHERE id = 1"
 ```
 
-## Using the Lexer
+---
 
-The lexer tokenizes SQL input into structured tokens. Each token has a type and value.
+## Workload Assumptions
 
-### Lexer Package
+The storage engine is designed for **OLTP** (Online Transaction Processing):
 
-Location: `lexer/lexer.go`
+| Assumption | Design choice |
+|---|---|
+| Short transactions (single-row reads/writes) | Direct page I/O, no buffer pool |
+| Point lookups dominate | Stable `RID` (page+slot) for O(1) fetch |
+| Occasional full-table scans | Sequential `Scan()` walks pages in order |
+| Row sizes fit in one page | Max row ≈ 8 KiB; no overflow pages yet |
+| Single-writer, no crash recovery | Coarse mutex per `HeapFile`; no WAL/redo log |
+| Tables grow via append | Freelist not yet implemented; deleted space reclaimed by compaction on insert |
 
-### Token Types
+The engine does **not** implement: buffer pool, B-tree indexes, WAL, multi-version concurrency control, or cross-table joins. These are future layers in the course.
 
-- `KEYWORD`: SQL keywords (SELECT, FROM, WHERE, INSERT, CREATE, etc.)
-- `IDENTIFIER`: Table/column names
-- `OPERATOR`: Comparison operators (=, !=, <, >, <=, >=)
-- `NUMBER`: Numeric literals
-- `STRING`: String literals (single or double quoted)
-- `SEPARATOR`: Punctuation (parentheses, commas, asterisk, semicolon)
+---
 
-### Basic Usage
+## Storage Architecture
 
-```go
-package main
+```
+Application
+     │  Row ([]Value)
+     ▼
+storage.DB / TableHandle          ← table registry + per-table CRUD
+     │  Schema + encoded bytes
+     ▼
+storage.HeapFile                  ← append-only multi-segment file
+     │  Page (read/write by global page ID)
+     ▼
+storage.Page  (8 KiB slotted)     ← insert / fetch / delete / compact
+     │  raw [8192]byte
+     ▼
+OS file  (ReadAt / WriteAt)       ← no seek, no buffer pool
+```
 
-import (
-    "fmt"
-    "github.com/vvshulga/db_internals/lexer"
-)
+### Key types (all in `storage/`)
 
-func main() {
-    query := "SELECT id, name FROM users WHERE age > 18"
-    tokens := lexer.Tokenize(query)
-    
-    for _, token := range tokens {
-        fmt.Printf("Type: %s, Value: %s\n", token.Type, token.Value)
+| Type | Role |
+|---|---|
+| `DB` | Catalog: maps table names → schemas, manages `HeapFile` lifetimes, persists `catalog.json` |
+| `TableHandle` | Open table: bundles `HeapFile` + `Schema`, exposes `Insert/Get/Update/Delete/Scan` |
+| `Scanner` | Pull iterator: `Next() / RID() / Row() / Err()` |
+| `HeapFile` | Multi-segment data file for one table |
+| `Page` | 8 KiB slotted page; tuple insert / fetch / delete / compact |
+| `Schema` | Pre-computes column byte offsets once at construction |
+| `Value` / `Row` | Tagged-union value type; `Row = []Value` |
+| `RID` | `{PageID uint64, SlotID uint16}` — stable 10-byte row address |
+
+### Insert flow
+
+```
+tbl.Insert(row)
+      │
+      ▼
+1. Encode row → []byte
+   NullBitmap | Fixed columns | Var directory | Var data
+      │
+      ▼
+2. Read last data page  (PageID = TotalPages - 1)
+      │
+      ├── free space ≥ len(bytes) + 4 ──▶ 3a. Write tuple (grows ←)
+      │                                        Add slot entry (grows →)
+      │                                        Write page to disk
+      │                                        Return RID{PageID, SlotID}
+      │
+      └── full (ErrPageFull)
+            │
+            ▼
+         Compact()  ← reclaim tombstone space, repack tuples at end
+            │
+            ├── fits now ──▶ 3a (same as above)
+            │
+            └── still full
+                  │
+                  ▼
+               appendPage()  ← create new DataPage, increment TotalPages,
+                                update MetaPage on disk, write new page
+                  │
+                  ▼
+               3a on the new page
+```
+
+### Page state: insert, delete, compaction
+
+A page grows the **slot array rightward** and **tuple data leftward**.
+`FSO` = FreeSpaceOffset (end of slot array), `FSE` = FreeSpaceEnd (start of tuple data).
+
+**After inserting two tuples T0 and T1:**
+
+```
+byte:  0        19      27      31                      8152  8172  8192
+       ┌────────┬───────┬───────┬──────────────────────┬─────┬─────┐
+       │ Header │  S0   │  S1   │   · free space ·      │ T1  │ T0  │
+       └────────┴───────┴───────┴──────────────────────┴─────┴─────┘
+                         ↑ FSO=31                  FSE=8152 ↑
+S0 = {Offset:8172, Length:20}  → RID{PageID, SlotID:0}
+S1 = {Offset:8152, Length:20}  → RID{PageID, SlotID:1}
+```
+
+**After deleting T0 (SlotID 0):**
+
+```
+byte:  0        19      27      31                      8152  8172  8192
+       ┌────────┬───────┬───────┬──────────────────────┬─────┬─────┐
+       │ Header │ S0✗   │  S1   │   · free space ·      │ T1  │ T0  │
+       └────────┴───────┴───────┴──────────────────────┴─────┴─────┘
+                         ↑ FSO=31 (unchanged)       FSE=8152 ↑
+S0✗ = {0xFFFF, 0xFFFF}  ← tombstone sentinel
+T0 bytes still occupy the page; space is NOT reclaimed yet.
+Get(RID{PageID,0}) returns (nil, false, nil) — not found.
+```
+
+**After Compact() (triggered lazily when the next insert finds the page full):**
+
+```
+byte:  0        19      27      31                      8172  8192
+       ┌────────┬───────┬───────┬──────────────────────┬─────┐
+       │ Header │ S0✗   │  S1'  │   · free space ·      │ T1  │
+       └────────┴───────┴───────┴──────────────────────┴─────┘
+                         ↑ FSO=31               FSE=8172 ↑
+S1' = {Offset:8172, Length:20}  (T1 shifted; S1 SlotID unchanged)
+S0✗ tombstone remains — SlotIDs are never reused or renumbered.
+T0 bytes are gone; 20 bytes of free space reclaimed.
+```
+
+**Key invariants**
+
+- A `RID{PageID, SlotID}` is stable for the lifetime of a live tuple — `Get` uses it for O(1) lookup.
+- `Delete` is O(1): it writes the tombstone sentinel `{0xFFFF, 0xFFFF}` into the slot entry and writes the page back. Tuple bytes are left in place.
+- `Compact` is O(slots + tuples): it repacks all live tuples at the end of the page without reordering slot IDs.
+- `Update` = `Delete` old RID + `Insert` new row → the new row may land on a different page, producing a new RID.
+
+### Operation characteristics
+
+#### Well-optimized
+
+| Operation | Cost | Why |
+|---|---|---|
+| **Get by RID** | O(1), 1 page read | `PageID` maps directly to a file offset; `SlotID` is an array index into the slot table. No scanning. |
+| **Insert** | Amortized O(1), 1–2 page writes | Appends to the last data page. A new page is allocated only when the current one is full (rare relative to total inserts). |
+| **Delete** | O(1), 1 page read + 1 page write | Overwrites one slot entry with the tombstone sentinel. No data movement, no cascading updates. |
+| **Full-table scan** | O(pages), sequential I/O | Pages are read in order with `ReadAt`; no random access per row. Sequential I/O is cache-friendly and easy for the OS to prefetch. |
+
+#### Not optimized
+
+| Operation | Cost | Reason |
+|---|---|---|
+| **Lookup by field value** | O(rows), full scan | No secondary indexes exist. Finding a row by any column other than RID requires scanning every live tuple. |
+| **Range queries** | O(rows), full scan | Rows are stored in insertion order within pages, not sorted by any key. Range predicates cannot skip pages. |
+| **Update** | 2× single-row cost | Always a delete-then-reinsert. Two page writes minimum; the new row may land on a different page, making the new RID unpredictable for callers. |
+| **Write-heavy workloads with many deletes** | Scan degrades over time | Tombstone slots accumulate in pages and are only reclaimed by `Compact`, which fires lazily on the next insert into a full page. A page with many tombstones wastes read bandwidth during scans because all slot entries are visited. |
+| **Concurrent writes** | Serialised per table | A single `sync.Mutex` guards the entire `HeapFile`. Multiple goroutines writing to the same table are fully serialised — no per-page or per-row latching. |
+| **Rows larger than ~8 KiB** | Not supported | A tuple must fit within one page. There are no overflow pages; inserts that exceed available page space fail. |
+
+---
+
+## On-Disk Layout
+
+### Directory structure
+
+```
+<data-dir>/
+  catalog.json          ← JSON table registry (names + column definitions)
+  catalog.json.tmp      ← atomic write scratch file (rename → catalog.json)
+  users.0.heap          ← segment 0 of table "users"  (up to 1 GiB)
+  users.1.heap          ← segment 1 of table "users"  (created when seg 0 fills)
+  orders.0.heap         ← segment 0 of table "orders"
+  ...
+```
+
+Each table's data spans one or more segment files named `<table>.N.heap`.
+A **global page ID** is used in every `RID`; the segment is derived transparently:
+
+```
+segmentID  = PageID / 131072
+localPage  = PageID % 131072
+fileOffset = localPage × 8192
+```
+
+### Segment file layout
+
+```
+Segment file (<table>.N.heap)
+┌──────────────────────────────────┐  ← offset 0 (only in segment 0)
+│  Page 0 — MetaPage               │
+│  slot 0: TotalPages (uint64 LE)  │  8 bytes; 56 bytes reserved
+├──────────────────────────────────┤  ← offset 8192
+│  Page 1 — DataPage  (first data) │
+├──────────────────────────────────┤  ← offset 16384
+│  Page 2 — DataPage               │
+│  ...                             │
+└──────────────────────────────────┘
+```
+
+### Page layout (8192 bytes)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Header  (19 bytes, little-endian)                               │
+│    PageID          [0..7]   uint64                               │
+│    PageType        [8]      uint8   (1=Data 2=Overflow 3=Meta)   │
+│    NumSlots        [9..10]  uint16                               │
+│    FreeSpaceOffset [11..12] uint16  ← next free byte (grows →)  │
+│    FreeSpaceEnd    [13..14] uint16  ← tuple area start (grows ←)│
+│    Checksum        [15..18] uint32  CRC32-IEEE                   │
+├─────────────────────────────────────────────────────────────────┤
+│  Slot array  (4 bytes × NumSlots, grows →)                       │
+│    Each slot: Offset uint16 + Length uint16                      │
+│    Deleted sentinel: Offset=0xFFFF, Length=0xFFFF               │
+├─────────────────────────────────────────────────────────────────┤
+│  Free space                                                      │
+├─────────────────────────────────────────────────────────────────┤
+│  Tuple data  (grows ←, packed at end of page)                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Record (tuple) binary format
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ NullBitmap  ceil(N/8) bytes                                     │
+│   bit i = 1 → column i is NULL  (LSB-first within each byte)   │
+├────────────────────────────────────────────────────────────────┤
+│ Fixed region  (one entry per fixed-length column, in order)     │
+│   INT       → 4 bytes  (int32 LE)                              │
+│   BIGINT    → 8 bytes  (int64 LE)                              │
+│   FLOAT     → 4 bytes  (IEEE 754 LE)                           │
+│   DOUBLE    → 8 bytes  (IEEE 754 LE)                           │
+│   BOOLEAN   → 1 byte   (0x00 / 0x01)                           │
+│   DATETIME  → 8 bytes  (int64 Unix nanoseconds LE)             │
+│   (slot always present even if NULL — null bitmap is authority) │
+├────────────────────────────────────────────────────────────────┤
+│ Var directory  (4 bytes per variable-length column, in order)   │
+│   Offset uint16 LE  — byte offset from start of var-data region │
+│   Length uint16 LE  — byte length; both 0 if NULL              │
+├────────────────────────────────────────────────────────────────┤
+│ Var data  (VARCHAR / TEXT values, concatenated, no padding)     │
+└────────────────────────────────────────────────────────────────┘
+Total = ceil(N/8) + fixedSize + 4×numVarCols + Σ(varDataLengths)
+```
+
+### catalog.json format
+
+```json
+{
+  "tables": {
+    "users": {
+      "columns": [
+        { "name": "id",    "type": 1 },
+        { "name": "name",  "type": 7, "max_len": 64 },
+        { "name": "score", "type": 4, "nullable": true }
+      ]
     }
+  }
 }
 ```
 
-### Token Output Example
+Column `type` values: 1=INT, 2=BIGINT, 3=FLOAT, 4=DOUBLE, 5=BOOLEAN, 6=DATETIME, 7=VARCHAR, 8=TEXT.
 
-```
-Type: KEYWORD, Value: SELECT
-Type: IDENTIFIER, Value: id
-Type: SEPARATOR, Value: ,
-Type: IDENTIFIER, Value: name
-Type: KEYWORD, Value: FROM
-Type: IDENTIFIER, Value: users
-Type: KEYWORD, Value: WHERE
-Type: IDENTIFIER, Value: age
-Type: OPERATOR, Value: >
-Type: NUMBER, Value: 18
-```
+---
 
-## Using the Parser
-
-The parser builds an Abstract Syntax Tree (AST) from tokens, validating SQL syntax and structure.
-
-### Parser Package
-
-Location: `parser/parser.go`
-
-### AST Node Types
-
-#### Statement Nodes
-
-- `SelectStmt`: SELECT queries with optional WHERE and LIMIT clauses
-- `InsertStmt`: INSERT queries with column values
-- `CreateTableStmt`: CREATE TABLE queries with column definitions
-
-#### Expression Nodes
-
-- `ColumnRef`: Column references (e.g., `id`, `users.name`)
-- `LiteralInt`: Integer literals (e.g., `42`, `1000`)
-- `LiteralString`: String literals (e.g., `'Alice'`, `"Bob"`)
-- `ComparisonOp`: Comparison expressions (e.g., `id > 18`)
-- `LogicalOp`: AND/OR operations
-- `BinaryOp`: Binary expressions
-
-### Basic Usage
+## Table Manager API
 
 ```go
-package main
+// Open or create a database directory.
+db, err := storage.OpenDB("/var/db/mydb")
+defer db.Close()
 
-import (
-    "fmt"
-    "github.com/vvshulga/db_internals/parser"
-)
+// Define a schema.
+schema, _ := storage.NewSchema([]storage.Column{
+    {Name: "id",   Type: storage.TypeINT},
+    {Name: "name", Type: storage.TypeVARCHAR, MaxLen: 128},
+})
 
-func main() {
-    query := "SELECT id, name FROM users WHERE id = 5"
-    
-    nodes, err := parser.ParseString(query)
-    if err != nil {
-        fmt.Println("Parse error:", err)
-        return
-    }
-    
-    // Use the AST nodes
-    for _, node := range nodes {
-        fmt.Printf("%+v\n", node)
-    }
+// create_table — returns an open TableHandle.
+tbl, err := db.CreateTable("users", schema)
+
+// open_table — reopens an existing table (returns cached handle if already open).
+tbl, err = db.OpenTable("users")
+
+// insert — returns a stable RID.
+rid, err := tbl.Insert(storage.Row{
+    storage.NewIntValue(1),
+    storage.NewVarcharValue("Alice"),
+})
+
+// get — (row, true, nil) found; (nil, false, nil) deleted/missing; (nil, false, err) I/O error.
+row, ok, err := tbl.Get(rid)
+
+// update — delete-then-reinsert; returns new RID.
+newRID, ok, err := tbl.Update(rid, storage.Row{
+    storage.NewIntValue(1),
+    storage.NewVarcharValue("Alice (updated)"),
+})
+
+// delete — (true, nil) deleted; (false, nil) already gone; (false, err) I/O error.
+ok, err = tbl.Delete(rid)
+
+// scan — pull iterator over all live rows in page order.
+s := tbl.Scan()
+for s.Next() {
+    rid, row := s.RID(), s.Row()
+    _ = rid; _ = row
 }
+if err := s.Err(); err != nil { ... }
+
+// drop_table — closes, removes heap files, removes from catalog.
+err = db.DropTable("users")
 ```
 
-### Printing the AST
+---
 
-```go
-astStr := parser.PrintAST(nodes)
-fmt.Println(astStr)
-```
+## storage_cli
 
-### Example AST Output
-
-```
-SELECT
-  Projections: [id, name]
-  From: users
-  Where: (id = 5)
-```
-
-## Using the CLI Tool
-
-The CLI tool provides an interactive way to tokenize and parse SQL queries.
-
-### Command Format
+`storage_cli` is a command-line tool that exposes the full table management API over the shell. Build it once; every invocation opens the database directory, runs the command, and closes cleanly — demonstrating that data persists across process restarts.
 
 ```bash
-./db_internals "<SQL_QUERY>"
+go build -o storage_cli ./cmd/storage_cli/
 ```
 
-### Examples
+**Global flag**
 
-#### Example 1: Simple SELECT Query
+```
+storage_cli [--dir <path>] <command> [args...]
+    --dir   database directory (default: ./data)
+```
+
+**Command reference**
+
+| Command | Syntax | Example |
+|---|---|---|
+| `list-tables` | `list-tables` | `./storage_cli --dir ./data list-tables` |
+| `describe` | `describe <table>` | `./storage_cli --dir ./data describe users` |
+| `create-table` | `create-table <table> <col:type> ...` | see below |
+| `drop-table` | `drop-table <table>` | `./storage_cli --dir ./data drop-table users` |
+| `insert` | `insert <table> <val> ...` | `./storage_cli --dir ./data insert users 1 Alice` |
+| `get` | `get <table> <pageID:slotID>` | `./storage_cli --dir ./data get users 1:0` |
+| `update` | `update <table> <pageID:slotID> <val> ...` | `./storage_cli --dir ./data update users 1:0 1 Bob` |
+| `delete` | `delete <table> <pageID:slotID>` | `./storage_cli --dir ./data delete users 1:0` |
+| `scan` | `scan <table>` | `./storage_cli --dir ./data scan users` |
+
+**Column types for `create-table`**: `int`, `bigint`, `float`, `double`, `boolean`, `datetime`, `varchar(N)`, `text`. Append `?` to any type to mark it nullable (e.g. `score:double?`).
+
+Specs that contain shell-special characters (`(`, `)`, `?`) must be quoted:
 
 ```bash
-./db_internals "SELECT * FROM users"
+./storage_cli --dir ./data create-table users \
+    id:int \
+    'name:varchar(64)' \
+    'score:double?'
 ```
 
-Output:
+**Output conventions**
+
+- `insert` prints `inserted <pageID:slotID>`
+- `update` prints `updated <pageID:slotID>` (new RID) — update is delete-then-reinsert
+- `delete` prints `deleted` or `not found`
+- `get` and `scan` print `<pageID:slotID>  col=val  col=val  ...`
+
+---
+
+## Demo
+
+`demo.sh` is an end-to-end script that walks through the full employee lifecycle using every `storage_cli` command. It serves as both a quick sanity check and a self-documenting example.
+
+```bash
+go build -o storage_cli ./cmd/storage_cli/
+bash demo.sh
 ```
-Received query: SELECT * FROM users
 
-Tokens:
-  Type: KEYWORD, Value: SELECT
-  Type: SEPARATOR, Value: *
-  Type: KEYWORD, Value: FROM
-  Type: IDENTIFIER, Value: users
+The script creates a temporary database directory (cleaned up on exit) and runs 14 steps:
 
-AST:
-SELECT
-  Projections: [*]
-  From: users
-```
+1. `create-table` — creates an `employees` table with five columns
+2. `list-tables` — verifies the table appears in the catalog
+3. `describe` — shows the schema
+4. `insert` × 5 — inserts Alice, Bob, Carol, Dave, Eve; captures their RIDs
+5. `scan` — prints all five rows
+6. `get` — fetches Alice by RID
+7. `update` — promotes Alice (new department, higher salary); prints her new RID
+8. `scan` — shows Alice at her new RID, old slot is a tombstone
+9. `delete` — removes Bob
+10. `get` — tries Bob's old RID → `not found`
+11. `scan` — four remaining employees, Bob's slot skipped
+12. persistence — re-runs `list-tables` and `scan` to confirm data survives process restarts
+13. `drop-table` — removes the table and its heap files
+14. `list-tables` — confirms the catalog is empty
 
-#### Example 2: SELECT with WHERE Clause
+Expected final line: `✓  demo complete`
+
+---
+
+## SQL Frontend
+
+The `lexer` and `parser` packages tokenize SQL and build an AST. They are not yet connected to the storage engine.
+
+**Supported statements**: `SELECT`, `INSERT INTO`, `CREATE TABLE`
 
 ```bash
 ./db_internals "SELECT id, name FROM users WHERE age > 18 LIMIT 10"
-```
-
-#### Example 3: INSERT Query
-
-```bash
 ./db_internals "INSERT INTO products VALUES (1, 'Laptop', 999)"
-```
-
-#### Example 4: CREATE TABLE Query
-
-```bash
 ./db_internals "CREATE TABLE employees (id INT, name TEXT, salary INT)"
 ```
 
-### Error Handling
+**WHERE operators**: `=  !=  <  >  <=  >=`
+**Logical operators**: `AND  OR`
 
-The tool validates SQL syntax and reports errors:
-
-```bash
-./db_internals "SELECT FROM users"
-```
-
-Output:
-```
-Received query: SELECT FROM users
-
-Tokens:
-  Type: KEYWORD, Value: SELECT
-  Type: KEYWORD, Value: FROM
-  Type: IDENTIFIER, Value: users
-
-Parse error: expected projections or * after SELECT
-```
-
-## Supported SQL
-
-### SELECT Statements
-
-```sql
-SELECT col1, col2 FROM table_name;
-SELECT * FROM table_name;
-SELECT col1 FROM table_name WHERE col1 > 10 AND col2 = 'value';
-SELECT col1 FROM table_name WHERE col1 = 5 LIMIT 10;
-```
-
-### INSERT Statements
-
-```sql
-INSERT INTO table_name VALUES (1, 'Alice', 42);
-INSERT INTO table_name (col1, col2) VALUES (100, 'Bob');
-```
-
-### CREATE TABLE Statements
-
-```sql
-CREATE TABLE users (id INT, name TEXT);
-CREATE TABLE products (id INT, name TEXT, price INT);
-```
-
-### WHERE Clauses
-
-Supported operators:
-- `=`: Equal
-- `!=`: Not equal
-- `<`: Less than
-- `>`: Greater than
-- `<=`: Less than or equal
-- `>=`: Greater than or equal
-
-Supported logical operators:
-- `AND`: Logical AND
-- `OR`: Logical OR
+---
 
 ## Testing
 
-The project includes comprehensive test suites for both lexer and parser.
+```bash
+go test -v -race ./...                                  # all packages
+go test -v -race ./storage/...                          # storage only
+go test -v -race -run TestTableHandle ./storage/...     # single test by prefix
+```
 
-### Run All Tests
+The project uses GitHub Actions to run the full test suite on every push (`.github/workflows/tests.yml`).
+
+### Benchmarks
 
 ```bash
-go test ./...
+go test -bench=. -benchmem ./storage/...
 ```
 
-### Run Tests with Verbose Output
+Results on Intel Core i7-9750H (darwin/amd64):
 
-```bash
-go test -v ./...
-```
-
-### Run Specific Package Tests
-
-```bash
-go test -v ./lexer
-go test -v ./parser
-```
-
-### Run Tests with Coverage Report
-
-```bash
-go test -v -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-```
-
-### Test Categories
-
-#### Lexer Tests (`lexer/lexer_test.go`)
-
-- Tokenization of SQL statements
-- Handling of strings, numbers, operators
-- Unclosed string handling
-- Mismatched parentheses detection
-
-#### Parser Tests (`parser/parser_test.go`)
-
-- AST node creation and validation
-- AST structure correctness
-- Error handling for malformed queries
-- Unclosed strings and mismatched parentheses
-
-### Current Test Results
-
-All tests pass with comprehensive coverage of:
-- 12+ lexer test cases
-- 9+ parser test cases including edge cases
-
-## Architecture
-
-### Project Structure
-
-```
-db_internals/
-├── main.go           # CLI entry point
-├── go.mod            # Go module definition
-├── README.md         # Documentation
-├── grammar.bnf       # SQL grammar specification
-├── lexer/            # Tokenization package
-│   ├── lexer.go      # Lexer implementation
-│   └── lexer_test.go # Lexer tests
-├── parser/           # Parser package
-│   ├── parser.go     # Parser and AST definitions
-│   └── parser_test.go # Parser tests
-└── .github/
-    └── workflows/
-        └── tests.yml # GitHub Actions workflow
-```
-
-### Data Flow
-
-```
-SQL Query (string)
-    ↓
-Lexer (lexer.Tokenize)
-    ↓
-Token Stream
-    ↓
-Parser (parser.ParseString)
-    ↓
-AST (Abstract Syntax Tree)
-    ↓
-Printer (parser.PrintAST)
-    ↓
-Formatted Output
-```
-
-## Continuous Integration
-
-This project uses GitHub Actions to automatically run tests on every push. See `.github/workflows/tests.yml` for the workflow configuration.
-
-## License
-
-Educational project for DB Internals course.
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| `BenchmarkInsert` | 10,785 | 36,956 | 7 |
+| `BenchmarkGet` | 4,146 | 17,744 | 5 |
+| `BenchmarkUpdate` | 24,855 | 82,937 | 12 |
+| `BenchmarkDelete` | 14,102 | 38,373 | 5 |
+| `BenchmarkScan/rows=10` | 6,221 | 19,732 | 29 |
+| `BenchmarkScan/rows=100` | 16,675 | 36,773 | 212 |
+| `BenchmarkScan/rows=1000` | 170,811 | 214,951 | 2,021 |

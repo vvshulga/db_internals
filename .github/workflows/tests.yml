@@ -29,3 +29,6 @@ jobs:
     
     - name: Display coverage
       run: go tool cover -func=coverage.out | grep total
+
+    - name: Run benchmarks
+      run: go test -bench=. -benchmem -benchtime=1s ./storage/...
