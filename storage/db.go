@@ -59,6 +59,9 @@ func OpenDB(dir string) (*DB, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("storage.OpenDB: mkdir %q: %w", dir, err)
 	}
+	// Remove any stale tmp file left by a crashed CreateTable/DropTable.
+	// The rename never completed, so catalog.json is still authoritative.
+	_ = os.Remove(filepath.Join(dir, catalogTmpFileName))
 	db := &DB{dir: dir, tables: make(map[string]*tableEntry)}
 	if err := db.loadCatalog(); err != nil {
 		return nil, fmt.Errorf("storage.OpenDB: %w", err)
@@ -166,6 +169,52 @@ func (db *DB) OpenTable(name string) (*TableHandle, error) {
 	handle := &TableHandle{name: name, schema: e.schema, heap: heap}
 	e.handle = handle
 	return handle, nil
+}
+
+// ValidationIssue describes a single problem found during a Validate scan.
+type ValidationIssue struct {
+	Table   string // table name
+	PageID  uint64 // 0 = meta/catalog-level problem; ≥1 = data page
+	Problem string // human-readable description
+}
+
+// Validate scans every table in the catalog and checks that all pages can be
+// read and pass their CRC32 checksum. It returns one ValidationIssue per
+// problem found; a nil/empty slice means the database is healthy.
+//
+// Validate does not modify any data. It is safe to call on a live database.
+func (db *DB) Validate() []ValidationIssue {
+	db.mu.Lock()
+	names := make([]string, 0, len(db.tables))
+	for name := range db.tables {
+		names = append(names, name)
+	}
+	db.mu.Unlock()
+
+	var issues []ValidationIssue
+	for _, name := range names {
+		heap, err := OpenHeapFile(db.dir, name)
+		if err != nil {
+			issues = append(issues, ValidationIssue{
+				Table:   name,
+				PageID:  0,
+				Problem: fmt.Sprintf("cannot open heap file: %v", err),
+			})
+			continue
+		}
+		total := heap.PageCount()
+		for pageID := uint64(1); pageID < total; pageID++ {
+			if _, err := heap.readPage(pageID); err != nil {
+				issues = append(issues, ValidationIssue{
+					Table:   name,
+					PageID:  pageID,
+					Problem: err.Error(),
+				})
+			}
+		}
+		_ = heap.Close()
+	}
+	return issues
 }
 
 // TableNames returns an alphabetically sorted list of all known table names.

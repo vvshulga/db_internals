@@ -13,6 +13,7 @@ Education project for the DB Internals CS osvita course. Implements an OLTP row-
 - [Table Manager API](#table-manager-api)
 - [storage\_cli](#storage_cli)
 - [Demo](#demo)
+- [Running and Recovery](#running-and-recovery)
 - [SQL Frontend](#sql-frontend)
 - [Testing](#testing)
 
@@ -420,6 +421,81 @@ The script creates a temporary database directory (cleaned up on exit) and runs 
 14. `list-tables` — confirms the catalog is empty
 
 Expected final line: `✓  demo complete`
+
+---
+
+## Running and Recovery
+
+### Lifecycle
+
+The storage engine is a **library**, not a daemon. There is no persistent background process:
+
+```
+1. OpenDB(dir)       ← read catalog.json, validate directory
+2. OpenTable / CRUD  ← HeapFile opened lazily on first use; pages read/written directly
+3. Close()           ← fsync + close all open segment files
+```
+
+Each `storage_cli` invocation runs steps 1–3, exits, then the next call repeats from step 1.
+This is safe because every write that completes reaches disk before the process exits:
+`writePage` uses `WriteAt` (no OS buffering beyond the page cache), and `persistCatalog`
+uses an atomic rename.
+
+### Normal restart
+
+When a process opens the database after a clean shutdown:
+
+| Step | Code path | Effect |
+|---|---|---|
+| `OpenDB(dir)` | `os.MkdirAll` + remove stale `catalog.json.tmp` + `loadCatalog` | Table names and schemas loaded into memory |
+| `OpenTable(name)` | `OpenHeapFile` → `readMeta` (page 0) | `TotalPages` restored; heap ready |
+| First `Insert/Get/Scan` | `readPage(pageID)` → `Unmarshal` → CRC32 check | Every read validates its checksum |
+
+All rows that were written before the previous `Close()` are immediately visible.
+No replay or recovery step is needed.
+
+### Crash scenarios
+
+A crash (power loss, SIGKILL, panic) while a write is in progress can leave the database in a partially updated state.
+
+| In-flight operation | On-disk state after crash | Effect on restart |
+|---|---|---|
+| `Insert` (writing a data page) | Page may have bad checksum or be partially written | `readPage` returns a checksum error for that page; other pages unaffected |
+| `appendPage` (writing new data page before `writeMeta`) | New page exists on disk; `TotalPages` not updated | Orphaned page (wastes space); no data loss for any existing row |
+| `writeMeta` (rewriting page 0) | Meta page may have bad checksum | Table inaccessible until page 0 is repaired or table is dropped and recreated |
+| `persistCatalog` (write to `catalog.json.tmp`) | `catalog.json.tmp` exists; rename never ran | `OpenDB` removes the tmp file; `catalog.json` remains authoritative — no data loss |
+| `persistCatalog` (rename atomically) | Either old or new catalog visible, never both | Correct state either way |
+
+### Recovery steps
+
+| Symptom | Diagnosis | Action |
+|---|---|---|
+| `Validate()` reports a CRC error on a data page | Partial write during insert | Affected rows on that page are inaccessible; other pages are fine. Scan remaining pages, export live data, drop and recreate the table. |
+| `Validate()` reports a CRC error on page 0 (meta page) | Crash during `writeMeta` | Table cannot be opened. Drop the table (removes heap files) and recreate it from a backup. |
+| `OpenDB` fails with corrupt catalog | Crash during catalog rename — extremely rare due to atomic rename | Restore `catalog.json` from a backup or reconstruct it by inspecting `*.heap` files. |
+| Extra `*.heap` files with no matching catalog entry | Orphaned segments from a crashed `appendPage` | Safe to delete manually. |
+
+### Using `DB.Validate()`
+
+`Validate` reads every page in every table and returns one `ValidationIssue` per bad page:
+
+```go
+db, err := storage.OpenDB("/var/db/mydb")
+if err != nil { log.Fatal(err) }
+defer db.Close()
+
+issues := db.Validate()
+if len(issues) == 0 {
+    fmt.Println("database is healthy")
+} else {
+    for _, iss := range issues {
+        fmt.Printf("table=%s page=%d: %s\n", iss.Table, iss.PageID, iss.Problem)
+    }
+}
+```
+
+`Validate` is read-only and safe to call on a live database. It leverages the CRC32 checksum
+that is already validated on every `Unmarshal`, so corrupt pages are detected at no extra cost.
 
 ---
 
