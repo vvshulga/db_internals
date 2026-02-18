@@ -176,16 +176,38 @@ T0 bytes are gone; 20 bytes of free space reclaimed.
 | **Delete** | O(1), 1 page read + 1 page write | Overwrites one slot entry with the tombstone sentinel. No data movement, no cascading updates. |
 | **Full-table scan** | O(pages), sequential I/O | Pages are read in order with `ReadAt`; no random access per row. Sequential I/O is cache-friendly and easy for the OS to prefetch. |
 
-#### Not optimized
+#### With a column index (`CreateIndex`)
+
+When a B-tree index exists on a column, point lookups and range queries skip
+the full-table scan entirely. The index is persisted to `<table>.<col>.idx`
+and auto-loaded on `OpenTable`.
+
+| Operation | Complexity | Notes |
+|---|---|---|
+| **`LookupExact`** | O(log n) | B-tree point lookup; no page I/O for the search itself |
+| **`RangeScan`** | O(log n + k) | k = matching rows; each hit requires one heap page read |
+| **`Insert` overhead** | O(log n) | One B-tree insert per indexed column after the heap write |
+| **`Delete` overhead** | O(log n) | One heap fetch (to read old value) + one B-tree delete |
+| **Index open / rebuild** | O(n) | Flat-file replay on `OpenTable`; n = index entry count |
+
+**Benchmark comparison — 1 000-row table, `id INT` index (Intel i7-9750H):**
+
+| Operation | Time/op | Allocs/op | Notes |
+|---|---|---|---|
+| Full-table scan (find by value) | 122 520 ns | 2 024 | Reads all pages, materialises all rows |
+| Index lookup (`LookupExact`) | 179 ns | 1 | **~684× faster** than full scan |
+| Index insert | 12 404 ns | 7 | Heap write + B-tree insert |
+| Range scan (~10% of rows) | 539 067 ns | 505 | 100-row range, 1 heap fetch per hit |
+
+#### Not optimized (without an index)
 
 | Operation | Cost | Reason |
 |---|---|---|
-| **Lookup by field value** | O(rows), full scan | No secondary indexes exist. Finding a row by any column other than RID requires scanning every live tuple. |
+| **Lookup by field value** | O(rows), full scan | Without an index, finding a row by any column requires scanning every live tuple. |
 | **Range queries** | O(rows), full scan | Rows are stored in insertion order within pages, not sorted by any key. Range predicates cannot skip pages. |
 | **Update** | 2× single-row cost | Always a delete-then-reinsert. Two page writes minimum; the new row may land on a different page, making the new RID unpredictable for callers. |
 | **Write-heavy workloads with many deletes** | Scan degrades over time | Tombstone slots accumulate in pages and are only reclaimed by `Compact`, which fires lazily on the next insert into a full page. A page with many tombstones wastes read bandwidth during scans because all slot entries are visited. |
 | **Concurrent writes** | Serialised per table | A single `sync.Mutex` guards the entire `HeapFile`. Multiple goroutines writing to the same table are fully serialised — no per-page or per-row latching. |
-| **Rows larger than ~8 KiB** | Not supported | A tuple must fit within one page. There are no overflow pages; inserts that exceed available page space fail. |
 
 ---
 

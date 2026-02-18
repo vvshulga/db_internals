@@ -153,3 +153,38 @@ type ErrCorruptCatalog struct {
 func (e *ErrCorruptCatalog) Error() string {
 	return fmt.Sprintf("storage: corrupt catalog: %s", e.Reason)
 }
+
+// ErrIndexExists is returned by CreateIndex when an index for the column
+// already exists on the table.
+type ErrIndexExists struct {
+	Table  string
+	Column string
+}
+
+func (e *ErrIndexExists) Error() string {
+	return fmt.Sprintf("storage: index on %q.%q already exists", e.Table, e.Column)
+}
+
+// ErrIndexNotFound is returned by DropIndex and LookupExact when no index
+// exists for the named column.
+type ErrIndexNotFound struct {
+	Table  string
+	Column string
+}
+
+func (e *ErrIndexNotFound) Error() string {
+	return fmt.Sprintf("storage: index on %q.%q not found", e.Table, e.Column)
+}
+
+// ErrUniqueViolation is returned by Index.Insert when a unique index already
+// contains a different RID for the same value.
+type ErrUniqueViolation struct {
+	Table  string
+	Column string
+	Value  Value
+}
+
+func (e *ErrUniqueViolation) Error() string {
+	return fmt.Sprintf("storage: unique violation on %q.%q: value %v already exists",
+		e.Table, e.Column, e.Value)
+}

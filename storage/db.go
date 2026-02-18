@@ -69,7 +69,7 @@ func OpenDB(dir string) (*DB, error) {
 	return db, nil
 }
 
-// Close syncs and closes all open table HeapFiles.
+// Close syncs and closes all open table HeapFiles and their indexes.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -140,6 +140,18 @@ func (db *DB) DropTable(name string) error {
 		}
 	}
 
+	// Remove all index files: <name>.<colName>.idx
+	idxPattern := filepath.Join(db.dir, name+".*.idx")
+	idxMatches, err := filepath.Glob(idxPattern)
+	if err != nil {
+		return fmt.Errorf("storage.DropTable %q: glob idx: %w", name, err)
+	}
+	for _, path := range idxMatches {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("storage.DropTable %q: remove %s: %w", name, path, err)
+		}
+	}
+
 	delete(db.tables, name)
 	if err := db.persistCatalog(); err != nil {
 		return fmt.Errorf("storage.DropTable %q: persist: %w", name, err)
@@ -167,6 +179,32 @@ func (db *DB) OpenTable(name string) (*TableHandle, error) {
 		return nil, fmt.Errorf("storage.OpenTable %q: %w", name, err)
 	}
 	handle := &TableHandle{name: name, schema: e.schema, heap: heap}
+
+	// Auto-load any persisted index files for this table.
+	idxPattern := filepath.Join(db.dir, name+".*.idx")
+	idxMatches, err := filepath.Glob(idxPattern)
+	if err != nil {
+		_ = heap.Close()
+		return nil, fmt.Errorf("storage.OpenTable %q: glob idx: %w", name, err)
+	}
+	for _, path := range idxMatches {
+		base := filepath.Base(path)
+		colName, ok := indexFileColName(name, base)
+		if !ok {
+			continue
+		}
+		ci, ok := e.schema.ColumnIndex(colName)
+		if !ok {
+			continue // column no longer in schema; skip stale file
+		}
+		idx, err := OpenIndex(db.dir, name, colName, ci, false)
+		if err != nil {
+			_ = heap.Close()
+			return nil, fmt.Errorf("storage.OpenTable %q: open index %q: %w", name, colName, err)
+		}
+		handle.attachIndex(idx)
+	}
+
 	e.handle = handle
 	return handle, nil
 }
