@@ -2,6 +2,13 @@ package storage
 
 import "fmt"
 
+// varDirEntrySize is the number of bytes occupied by one entry in the variable-
+// length column directory within a serialized record. Each entry is 12 bytes:
+//
+//	Inline:   [uint32 flag=0][uint16 Offset][uint16 Length][uint32 padding]
+//	Overflow: [uint32 flag=1][uint64 FirstOverflowPageID]
+const varDirEntrySize = 12
+
 // ---- DataType ----------------------------------------------------------------
 
 // DataType identifies the SQL type of a column.
@@ -153,7 +160,7 @@ func computeLayout(columns []Column) schemaLayout {
 	}
 	layout.fixedSize = fixedCursor
 	layout.varDirOffset = layout.nullBitmapSize + layout.fixedSize
-	layout.varDataOffset = layout.varDirOffset + 4*len(layout.varIndices)
+	layout.varDataOffset = layout.varDirOffset + varDirEntrySize*len(layout.varIndices)
 	return layout
 }
 

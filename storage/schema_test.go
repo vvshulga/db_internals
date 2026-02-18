@@ -138,14 +138,14 @@ func TestSchema_VarDirOffset(t *testing.T) {
 }
 
 func TestSchema_VarDataOffset(t *testing.T) {
-	// Schema: INT, VARCHAR, TEXT — bitmap=1, fixed=4, dir=2*4=8 → varDataOffset=13
+	// Schema: INT, VARCHAR, TEXT — bitmap=1, fixed=4, dir=2*12=24 → varDataOffset=29
 	s := makeSchema(t, []Column{
 		{Name: "id", Type: TypeINT},
 		{Name: "name", Type: TypeVARCHAR, MaxLen: 64},
 		{Name: "bio", Type: TypeTEXT},
 	})
-	if got := s.VarDataOffset(); got != 13 {
-		t.Errorf("VarDataOffset: got %d, want 13", got)
+	if got := s.VarDataOffset(); got != 29 {
+		t.Errorf("VarDataOffset: got %d, want 29", got)
 	}
 }
 
@@ -163,14 +163,14 @@ func TestSchema_ColumnIndex(t *testing.T) {
 }
 
 func TestSchema_MinRecordSize(t *testing.T) {
-	// Schema: INT, VARCHAR, TEXT — bitmap=1, fixed=4, dir=8 → min=13
+	// Schema: INT, VARCHAR, TEXT — bitmap=1, fixed=4, dir=2*12=24 → min=29
 	s := makeSchema(t, []Column{
 		{Name: "id", Type: TypeINT},
 		{Name: "name", Type: TypeVARCHAR, MaxLen: 64},
 		{Name: "bio", Type: TypeTEXT},
 	})
-	if got := s.MinRecordSize(); got != 13 {
-		t.Errorf("MinRecordSize: got %d, want 13", got)
+	if got := s.MinRecordSize(); got != 29 {
+		t.Errorf("MinRecordSize: got %d, want 29", got)
 	}
 }
 

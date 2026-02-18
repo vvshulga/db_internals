@@ -152,54 +152,46 @@ func (v Value) String() string {
 // Row is an ordered slice of Values, one per schema column.
 type Row []Value
 
+// Flags stored in bytes [0..3] of each var-directory entry.
+const (
+	varDirInlineFlag   = uint32(0) // value is stored inline in the var-data region
+	varDirOverflowFlag = uint32(1) // value is stored in an overflow page chain
+)
+
 // ---- Encode ------------------------------------------------------------------
 
 // Encode serializes row into a compact []byte according to schema.
 // The returned slice is ready to pass to Page.InsertTuple.
 //
-// Binary format:
+// Binary format (var-directory entries are 12 bytes each):
 //
 //	[NullBitmap: ceil(N/8) bytes, LSB-first, bit i=1 → col i is NULL]
 //	[Fixed region: fixed-length columns in schema order, always present]
-//	[Var directory: 4 bytes per var-length column — Offset uint16 LE + Length uint16 LE]
-//	[Var data: concatenated var-length values, no padding]
+//	[Var directory: 12 bytes per var-length column]
+//	  Inline:   [uint32 flag=0][uint16 Offset][uint16 Length][uint32 padding]
+//	  Overflow: [uint32 flag=1][uint64 FirstOverflowPageID]
+//	[Var data: concatenated inline var-length values, no padding]
+//
+// Only TEXT columns can overflow; VARCHAR is always stored inline.
+// Encode only handles inline data — use encodeWithOverflow (in overflow.go) for
+// rows that require overflow pages.
 //
 // Errors: ErrSchemaMismatch, ErrNullConstraint, ErrVarcharTooLong, ErrRowTooLarge.
 func Encode(schema *Schema, row Row) ([]byte, error) {
-	if len(row) != schema.NumColumns() {
-		return nil, &ErrSchemaMismatch{Got: len(row), Want: schema.NumColumns()}
+	if err := validateRow(schema, row); err != nil {
+		return nil, err
 	}
 
-	// Validate and measure variable-length data.
+	// Measure variable-length data (inline only).
 	varLengths := make([]int, len(schema.layout.varIndices))
 	totalVarData := 0
 	for vi, ci := range schema.layout.varIndices {
-		col := schema.columns[ci]
 		val := row[ci]
 		if val.IsNull() {
-			if !col.Nullable {
-				return nil, &ErrNullConstraint{ColumnIndex: ci, ColumnName: col.Name}
-			}
-			varLengths[vi] = 0
 			continue
 		}
-		s := val.strVal
-		n := len(s)
-		if col.Type == TypeVARCHAR && n > int(col.MaxLen) {
-			return nil, &ErrVarcharTooLong{
-				ColumnIndex: ci, ColumnName: col.Name,
-				MaxLen: col.MaxLen, ActualLen: n,
-			}
-		}
-		varLengths[vi] = n
-		totalVarData += n
-	}
-
-	// Validate fixed-length nullable columns.
-	for i, col := range schema.columns {
-		if col.Type.IsFixedLength() && row[i].IsNull() && !col.Nullable {
-			return nil, &ErrNullConstraint{ColumnIndex: i, ColumnName: col.Name}
-		}
+		varLengths[vi] = len(val.strVal)
+		totalVarData += len(val.strVal)
 	}
 
 	totalSize := schema.layout.varDataOffset + totalVarData
@@ -208,6 +200,24 @@ func Encode(schema *Schema, row Row) ([]byte, error) {
 		return nil, &ErrRowTooLarge{Size: totalSize, MaxSize: maxTupleSize}
 	}
 
+	return encodeGeneral(schema, row, varLengths, totalVarData, nil)
+}
+
+// encodeGeneral is the shared encoding implementation used by both Encode
+// (inline-only) and encodeWithOverflow (in overflow.go).
+//
+// varLengths[vi] is the byte length of the vi-th var column's inline value;
+// it must be 0 for overflow columns. totalVarData is the sum of varLengths.
+// overflowCols maps column index → first overflow page ID for TEXT columns
+// that have been moved out of line; nil means no overflow columns.
+func encodeGeneral(
+	schema *Schema,
+	row Row,
+	varLengths []int,
+	totalVarData int,
+	overflowCols map[int]uint64,
+) ([]byte, error) {
+	totalSize := schema.layout.varDataOffset + totalVarData
 	buf := make([]byte, totalSize)
 
 	// Fill null bitmap.
@@ -223,37 +233,68 @@ func Encode(schema *Schema, row Row) ([]byte, error) {
 		if !col.Type.IsFixedLength() {
 			continue
 		}
-		off := fixedBase + schema.layout.fixedOffsets[i]
 		val := row[i]
 		if val.IsNull() {
-			// Leave zeros — null bitmap is authoritative.
 			continue
 		}
+		off := fixedBase + schema.layout.fixedOffsets[i]
 		if err := encodeFixed(buf, off, val, col.Type); err != nil {
 			return nil, err
 		}
 	}
 
-	// Fill var directory and var data.
+	// Fill var directory (12 bytes per entry) and var data.
 	dirBase := schema.layout.varDirOffset
 	dataBase := schema.layout.varDataOffset
 	dataOff := 0
 	for vi, ci := range schema.layout.varIndices {
-		dirOff := dirBase + vi*4
+		dirOff := dirBase + vi*varDirEntrySize
 		val := row[ci]
 		if val.IsNull() {
-			// Leave offset=0, length=0 (null bitmap is authoritative).
+			// Leave all 12 bytes as zero (null bitmap is authoritative).
 			continue
 		}
-		s := val.strVal
-		n := len(s)
-		binary.LittleEndian.PutUint16(buf[dirOff:], uint16(dataOff))
-		binary.LittleEndian.PutUint16(buf[dirOff+2:], uint16(n))
-		copy(buf[dataBase+dataOff:], s)
-		dataOff += n
+		if firstPageID, ok := overflowCols[ci]; ok {
+			// Overflow entry: flag=1, followed by first overflow page ID.
+			binary.LittleEndian.PutUint32(buf[dirOff:], varDirOverflowFlag)
+			binary.LittleEndian.PutUint64(buf[dirOff+4:], firstPageID)
+		} else {
+			// Inline entry: flag=0, offset, length, padding.
+			n := varLengths[vi]
+			binary.LittleEndian.PutUint32(buf[dirOff:], varDirInlineFlag)
+			binary.LittleEndian.PutUint16(buf[dirOff+4:], uint16(dataOff))
+			binary.LittleEndian.PutUint16(buf[dirOff+6:], uint16(n))
+			// bytes [8:12] are already zero
+			copy(buf[dataBase+dataOff:], val.strVal)
+			dataOff += n
+		}
 	}
 
 	return buf, nil
+}
+
+// validateRow checks schema compatibility and per-column constraints, returning
+// the first error found.
+func validateRow(schema *Schema, row Row) error {
+	if len(row) != schema.NumColumns() {
+		return &ErrSchemaMismatch{Got: len(row), Want: schema.NumColumns()}
+	}
+	for i, col := range schema.columns {
+		val := row[i]
+		if val.IsNull() {
+			if !col.Nullable {
+				return &ErrNullConstraint{ColumnIndex: i, ColumnName: col.Name}
+			}
+			continue
+		}
+		if col.Type == TypeVARCHAR && len(val.strVal) > int(col.MaxLen) {
+			return &ErrVarcharTooLong{
+				ColumnIndex: i, ColumnName: col.Name,
+				MaxLen: col.MaxLen, ActualLen: len(val.strVal),
+			}
+		}
+	}
+	return nil
 }
 
 // ---- Decode ------------------------------------------------------------------
@@ -296,14 +337,22 @@ func Decode(schema *Schema, data []byte) (Row, error) {
 			row[ci] = NewNullValue()
 			continue
 		}
-		dirOff := schema.layout.varDirOffset + vi*4
-		if dirOff+4 > len(data) {
+		dirOff := schema.layout.varDirOffset + vi*varDirEntrySize
+		if dirOff+varDirEntrySize > len(data) {
 			return nil, &ErrCorruptRecord{
 				Reason: fmt.Sprintf("var directory entry %d out of bounds", vi),
 			}
 		}
-		relOffset := int(binary.LittleEndian.Uint16(data[dirOff:]))
-		length := int(binary.LittleEndian.Uint16(data[dirOff+2:]))
+		flag := binary.LittleEndian.Uint32(data[dirOff:])
+		if flag == varDirOverflowFlag {
+			// Overflow column: cannot resolve without a HeapFile reference.
+			// Callers that need overflow data must use decodeWithOverflow (overflow.go).
+			return nil, &ErrCorruptRecord{
+				Reason: fmt.Sprintf("var column %d is stored in overflow pages; use decodeWithOverflow", ci),
+			}
+		}
+		relOffset := int(binary.LittleEndian.Uint16(data[dirOff+4:]))
+		length := int(binary.LittleEndian.Uint16(data[dirOff+6:]))
 		if relOffset+length > varDataSize {
 			return nil, &ErrCorruptRecord{
 				Reason: fmt.Sprintf("var column %d data [%d:%d] out of bounds (var region size %d)",
@@ -359,12 +408,18 @@ func DecodeColumn(schema *Schema, data []byte, colIndex int) (Value, error) {
 		return Value{}, &ErrCorruptRecord{Reason: fmt.Sprintf("column %d not in var index", colIndex)}
 	}
 
-	dirOff := schema.layout.varDirOffset + vi*4
-	if dirOff+4 > len(data) {
+	dirOff := schema.layout.varDirOffset + vi*varDirEntrySize
+	if dirOff+varDirEntrySize > len(data) {
 		return Value{}, &ErrCorruptRecord{Reason: fmt.Sprintf("var directory entry %d out of bounds", vi)}
 	}
-	relOffset := int(binary.LittleEndian.Uint16(data[dirOff:]))
-	length := int(binary.LittleEndian.Uint16(data[dirOff+2:]))
+	flag := binary.LittleEndian.Uint32(data[dirOff:])
+	if flag == varDirOverflowFlag {
+		return Value{}, &ErrCorruptRecord{
+			Reason: fmt.Sprintf("column %d is stored in overflow pages; use decodeWithOverflow", colIndex),
+		}
+	}
+	relOffset := int(binary.LittleEndian.Uint16(data[dirOff+4:]))
+	length := int(binary.LittleEndian.Uint16(data[dirOff+6:]))
 	varDataSize := len(data) - schema.layout.varDataOffset
 	if relOffset+length > varDataSize {
 		return Value{}, &ErrCorruptRecord{

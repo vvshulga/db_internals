@@ -108,17 +108,23 @@ func (h *HeapFile) PageCount() uint64 {
 // Insert encodes row according to schema and stores it in the heap.
 // Returns the stable RID of the new row.
 //
+// TEXT column values too large to fit inline are automatically spilled to
+// overflow pages (see overflow.go). The insert is not atomic with respect to
+// overflow page writes: a crash between overflow writes and the main tuple
+// write leaves orphaned overflow pages (space leak, no data corruption).
+//
 // Strategy: try the last data page; if full, compact and retry; if still full,
 // allocate a new page (which may start a new segment file).
 func (h *HeapFile) Insert(schema *Schema, row Row) (RID, error) {
-	data, err := Encode(schema, row)
-	if err != nil {
-		return RID{}, err
-	}
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Encoding happens inside the lock because encodeWithOverflow may write
+	// overflow pages, which requires exclusive access to the heap file state.
+	data, err := encodeWithOverflow(schema, row, h)
+	if err != nil {
+		return RID{}, err
+	}
 	return h.insertEncoded(data)
 }
 
@@ -140,7 +146,7 @@ func (h *HeapFile) Fetch(schema *Schema, rid RID) (Row, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Decode(schema, data)
+	return decodeWithOverflow(schema, data, h)
 }
 
 // Delete marks the row identified by rid as deleted (tombstone).
@@ -165,20 +171,24 @@ func (h *HeapFile) Delete(rid RID) error {
 // Update performs a delete-then-reinsert. It is not atomic: a crash between
 // the two operations leaves the old row deleted without the new row present.
 // Returns the new RID of the updated row.
+//
+// Note: overflow pages from the old row are not reclaimed (space leak);
+// a freelist is needed for reclamation and is out of scope for this release.
 func (h *HeapFile) Update(schema *Schema, rid RID, newRow Row) (RID, error) {
-	data, err := Encode(schema, newRow)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Encode new row (may write overflow pages) before touching the old row.
+	newData, err := encodeWithOverflow(schema, newRow, h)
 	if err != nil {
 		return RID{}, err
 	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	if err := h.validateRID(rid); err != nil {
 		return RID{}, err
 	}
 
-	// Delete old row.
+	// Delete old row (overflow pages of the old row are leaked; see note above).
 	pg, err := h.readPage(rid.PageID)
 	if err != nil {
 		return RID{}, err
@@ -191,12 +201,15 @@ func (h *HeapFile) Update(schema *Schema, rid RID, newRow Row) (RID, error) {
 	}
 
 	// Insert new row.
-	return h.insertEncoded(data)
+	return h.insertEncoded(newData)
 }
 
 // Scan iterates over all live tuples in the heap in page order, calling fn for
 // each. If fn returns false the scan stops. If fn returns an error the scan
 // stops and that error is returned.
+//
+// Overflow pages (PageType == OverflowPage) are skipped automatically; they
+// are not independent rows and must not be presented to the caller.
 func (h *HeapFile) Scan(schema *Schema, fn func(RID, Row) (bool, error)) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -205,6 +218,11 @@ func (h *HeapFile) Scan(schema *Schema, fn func(RID, Row) (bool, error)) error {
 		pg, err := h.readPage(pageID)
 		if err != nil {
 			return err
+		}
+		// Skip overflow pages — they are part of a large TEXT value chain,
+		// not independent data rows.
+		if isOverflowPage(pg) {
+			continue
 		}
 		for s := 0; s < pg.NumSlots(); s++ {
 			slotID := SlotID(s)
@@ -216,7 +234,7 @@ func (h *HeapFile) Scan(schema *Schema, fn func(RID, Row) (bool, error)) error {
 				}
 				return err
 			}
-			row, err := Decode(schema, data)
+			row, err := decodeWithOverflow(schema, data, h)
 			if err != nil {
 				return err
 			}
@@ -335,35 +353,15 @@ func (h *HeapFile) readMeta() error {
 }
 
 // writeMeta serializes h.meta into the meta tuple on page 0.
-// It scans for the current live meta slot before replacing it, because
-// prior writeMeta calls may have tombstoned earlier slots.
+//
+// A fresh MetaPage is constructed on every call so that tombstone slot entries
+// do not accumulate. Each call leaves page 0 with exactly one live slot (slot 0).
 func (h *HeapFile) writeMeta() error {
-	pg, err := h.readPage(0)
-	if err != nil {
-		return err
-	}
-	// Find the current live meta slot.
-	liveSlot := SlotID(0)
-	found := false
-	for i := 0; i < pg.NumSlots(); i++ {
-		if _, err := pg.GetTuple(SlotID(i)); err == nil {
-			liveSlot = SlotID(i)
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("writeMeta: no live meta tuple on page 0")
-	}
-	if err := pg.DeleteTuple(liveSlot); err != nil {
-		return fmt.Errorf("writeMeta: delete old meta: %w", err)
-	}
-	pg.Compact()
-
+	pg := NewPage(0, MetaPage)
 	var buf [metaTupleSize]byte
 	binary.LittleEndian.PutUint64(buf[0:], h.meta.TotalPages)
 	if _, err := pg.InsertTuple(buf[:]); err != nil {
-		return fmt.Errorf("writeMeta: insert new meta: %w", err)
+		return fmt.Errorf("writeMeta: insert meta: %w", err)
 	}
 	return h.writePage(pg)
 }

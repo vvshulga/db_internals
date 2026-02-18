@@ -367,9 +367,10 @@ func TestDecode_CorruptVarOffset(t *testing.T) {
 	schema := mustSchema(t, []Column{{Name: "t", Type: TypeTEXT}})
 	row := Row{NewTextValue("hi")}
 	data := mustEncode(t, schema, row)
-	// Corrupt the var-directory offset to point beyond the buffer.
-	data[schema.VarDirOffset()] = 0xFF
-	data[schema.VarDirOffset()+1] = 0xFF
+	// Corrupt the Offset field (bytes [4..5] of the 12-byte dir entry) to point
+	// beyond the var-data buffer. Bytes [0..3] are the flag (must stay 0=inline).
+	data[schema.VarDirOffset()+4] = 0xFF
+	data[schema.VarDirOffset()+5] = 0xFF
 	_, err := Decode(schema, data)
 	var e *ErrCorruptRecord
 	if !errors.As(err, &e) {
