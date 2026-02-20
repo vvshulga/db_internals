@@ -68,8 +68,26 @@ func writeOverflowChain(h *HeapFile, data []byte) (uint64, error) {
 // The caller must hold h.mu.
 func readOverflowChain(h *HeapFile, firstPageID uint64) ([]byte, error) {
 	var result []byte
+	visited := make(map[uint64]bool)
 	pageID := firstPageID
+
 	for pageID != 0 {
+		// Cycle detection
+		if visited[pageID] {
+			return nil, &ErrCorruptRecord{
+				Reason: fmt.Sprintf("overflow chain cycle detected at page %d", pageID),
+			}
+		}
+		visited[pageID] = true
+
+		// Safety: limit chain length to prevent memory exhaustion
+		// 10K pages = ~80 MB TEXT (very generous upper bound)
+		if len(visited) > 10000 {
+			return nil, &ErrCorruptRecord{
+				Reason: fmt.Sprintf("overflow chain too long (%d pages)", len(visited)),
+			}
+		}
+
 		pg, err := h.readPage(pageID)
 		if err != nil {
 			return nil, fmt.Errorf("readOverflowChain page %d: %w", pageID, err)

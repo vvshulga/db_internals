@@ -85,6 +85,21 @@ func (db *DB) Close() error {
 	return firstErr
 }
 
+// Flush syncs all open tables to disk, ensuring all previous writes are durable.
+func (db *DB) Flush() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	for _, e := range db.tables {
+		if e.handle != nil {
+			if err := e.handle.Flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // CreateTable registers a new table with the given schema and returns an open
 // TableHandle ready for use. Returns ErrTableExists if the name is taken.
 func (db *DB) CreateTable(name string, schema *Schema) (*TableHandle, error) {

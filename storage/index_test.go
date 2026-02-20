@@ -413,3 +413,110 @@ func TestIndex_RangeScanOpenEnded(t *testing.T) {
 		t.Errorf("nil hi: expected 2, got %d: %v", len(ids), ids)
 	}
 }
+
+// TestIndexUniquePersistedOnReload verifies that the unique constraint flag
+// is persisted in the index file and restored correctly on DB reopen.
+func TestIndexUniquePersistedOnReload(t *testing.T) {
+	dir := t.TempDir()
+
+	// Phase 1: Create unique index and insert data.
+	var savedRID RID
+	{
+		db, err := OpenDB(dir)
+		if err != nil {
+			t.Fatalf("OpenDB: %v", err)
+		}
+
+		schema, err := NewSchema([]Column{
+			{Name: "id", Type: TypeINT},
+			{Name: "name", Type: TypeVARCHAR, MaxLen: 64},
+		})
+		if err != nil {
+			t.Fatalf("NewSchema: %v", err)
+		}
+
+		tbl, err := db.CreateTable("users", schema)
+		if err != nil {
+			t.Fatalf("CreateTable: %v", err)
+		}
+
+		// Insert a row.
+		savedRID, err = tbl.Insert(idRow(42, "Alice"))
+		if err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+
+		// Create unique index on id column.
+		if err := tbl.CreateIndex("id", true); err != nil {
+			t.Fatalf("CreateIndex: %v", err)
+		}
+
+		// Verify uniqueness works before closing.
+		_, err = tbl.Insert(idRow(42, "Bob"))
+		if err == nil {
+			t.Fatal("Insert duplicate: expected unique violation, got nil")
+		}
+		var uniqueErr *ErrUniqueViolation
+		if !errors.As(err, &uniqueErr) {
+			t.Fatalf("Insert duplicate: expected ErrUniqueViolation, got %T: %v", err, err)
+		}
+
+		if err := db.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+
+	// Phase 2: Reopen DB and verify unique constraint is still enforced.
+	{
+		db, err := OpenDB(dir)
+		if err != nil {
+			t.Fatalf("OpenDB (reopen): %v", err)
+		}
+		defer db.Close()
+
+		tbl, err := db.OpenTable("users")
+		if err != nil {
+			t.Fatalf("OpenTable: %v", err)
+		}
+
+		// Verify the index was reloaded with unique=true.
+		idx, ok := tbl.indexes["id"]
+		if !ok {
+			t.Fatal("index 'id' not found after reopen")
+		}
+		if !idx.unique {
+			t.Fatal("index 'id' should be unique after reload, but unique=false")
+		}
+
+		// Verify data survived.
+		row, ok, err := tbl.Get(savedRID)
+		if err != nil {
+			t.Fatalf("Get after reopen: %v", err)
+		}
+		if !ok {
+			t.Fatal("Get after reopen: row not found")
+		}
+		if row[0].AsInt() != 42 || row[1].AsString() != "Alice" {
+			t.Fatalf("Get after reopen: got %v, want (42, Alice)", row)
+		}
+
+		// Most importantly: verify uniqueness is still enforced.
+		_, err = tbl.Insert(idRow(42, "Charlie"))
+		if err == nil {
+			t.Fatal("Insert duplicate after reopen: expected unique violation, got nil")
+		}
+		var uniqueErr *ErrUniqueViolation
+		if !errors.As(err, &uniqueErr) {
+			t.Fatalf("Insert duplicate after reopen: expected ErrUniqueViolation, got %T: %v", err, err)
+		}
+
+		// Verify different value works.
+		rid2, err := tbl.Insert(idRow(99, "Dave"))
+		if err != nil {
+			t.Fatalf("Insert different id: %v", err)
+		}
+		if rid2 == savedRID {
+			t.Fatal("Insert: got same RID for different row")
+		}
+	}
+}

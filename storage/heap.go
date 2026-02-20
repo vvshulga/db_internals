@@ -98,6 +98,21 @@ func (h *HeapFile) Close() error {
 	return firstErr
 }
 
+// Flush syncs all open segment files to disk, ensuring all previous writes
+// are durable. This is called automatically by Close(), but can be called
+// explicitly when durability is required before closing.
+func (h *HeapFile) Flush() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for id, f := range h.segments {
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("flush segment %d: %w", id, err)
+		}
+	}
+	return nil
+}
+
 // PageCount returns the total number of pages in the heap (including page 0).
 func (h *HeapFile) PageCount() uint64 {
 	h.mu.Lock()

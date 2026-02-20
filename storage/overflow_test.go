@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -396,6 +398,107 @@ func TestOverflow_MultipleOverflowRows(t *testing.T) {
 		if got := row[1].AsString(); got != texts[i] {
 			t.Fatalf("row %d: length mismatch: got %d, want %d", i, len(got), len(texts[i]))
 		}
+	}
+}
+
+// TestOverflowChainCycleDetection verifies that readOverflowChain detects and
+// rejects cyclic chains (A→B→C→A) that could result from corruption.
+func TestOverflowChainCycleDetection(t *testing.T) {
+	tbl := openOverflowTable(t)
+	heap := tbl.heap
+
+	// Manually craft a cycle: page 1 → page 2 → page 1.
+	// This simulates corruption that could hang the database.
+
+	// Create page 1: next=2, data="chunk1"
+	pg1 := NewPage(1, DataPage)
+	var body1 [8 + 6]byte
+	binary.LittleEndian.PutUint64(body1[:8], 2) // next = page 2
+	copy(body1[8:], []byte("chunk1"))
+	if _, err := pg1.InsertTuple(body1[:]); err != nil {
+		t.Fatalf("InsertTuple page 1: %v", err)
+	}
+	if err := heap.writePage(pg1); err != nil {
+		t.Fatalf("writePage 1: %v", err)
+	}
+
+	// Create page 2: next=1, data="chunk2" (cycle back to page 1)
+	pg2 := NewPage(2, DataPage)
+	var body2 [8 + 6]byte
+	binary.LittleEndian.PutUint64(body2[:8], 1) // next = page 1 (CYCLE!)
+	copy(body2[8:], []byte("chunk2"))
+	if _, err := pg2.InsertTuple(body2[:]); err != nil {
+		t.Fatalf("InsertTuple page 2: %v", err)
+	}
+	if err := heap.writePage(pg2); err != nil {
+		t.Fatalf("writePage 2: %v", err)
+	}
+
+	// Update heap metadata to reflect that we have 3 pages total (0=meta, 1, 2).
+	heap.meta.TotalPages = 3
+	if err := heap.writeMeta(); err != nil {
+		t.Fatalf("writeMeta: %v", err)
+	}
+
+	// Try to read the cyclic chain starting from page 1.
+	_, err := readOverflowChain(heap, 1)
+	if err == nil {
+		t.Fatal("readOverflowChain: expected cycle detection error, got nil")
+	}
+
+	// Verify it's the right error type.
+	var corruptErr *ErrCorruptRecord
+	if !errors.As(err, &corruptErr) {
+		t.Fatalf("readOverflowChain: expected ErrCorruptRecord, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("readOverflowChain: error should mention 'cycle', got: %v", err)
+	}
+}
+
+// TestOverflowChainLengthLimit verifies that excessively long overflow chains
+// (>10000 pages) are rejected to prevent memory exhaustion attacks.
+func TestOverflowChainLengthLimit(t *testing.T) {
+	tbl := openOverflowTable(t)
+	heap := tbl.heap
+
+	// Create a chain of 10001 pages: 1→2→3→...→10001→0.
+	// This exceeds the 10000-page limit.
+	const chainLen = 10001
+	for i := uint64(1); i <= chainLen; i++ {
+		pg := NewPage(i, DataPage)
+		var body [8 + 4]byte
+		if i < chainLen {
+			binary.LittleEndian.PutUint64(body[:8], i+1) // next page
+		} else {
+			binary.LittleEndian.PutUint64(body[:8], 0) // end of chain
+		}
+		copy(body[8:], []byte("data"))
+		if _, err := pg.InsertTuple(body[:]); err != nil {
+			t.Fatalf("InsertTuple page %d: %v", i, err)
+		}
+		if err := heap.writePage(pg); err != nil {
+			t.Fatalf("writePage %d: %v", i, err)
+		}
+	}
+
+	heap.meta.TotalPages = chainLen + 1 // +1 for meta page
+	if err := heap.writeMeta(); err != nil {
+		t.Fatalf("writeMeta: %v", err)
+	}
+
+	// Try to read the chain - should fail at 10001st page.
+	_, err := readOverflowChain(heap, 1)
+	if err == nil {
+		t.Fatal("readOverflowChain: expected length limit error, got nil")
+	}
+
+	var corruptErr *ErrCorruptRecord
+	if !errors.As(err, &corruptErr) {
+		t.Fatalf("readOverflowChain: expected ErrCorruptRecord, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("readOverflowChain: error should mention 'too long', got: %v", err)
 	}
 }
 

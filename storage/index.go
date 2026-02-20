@@ -241,6 +241,7 @@ func (idx *Index) Len() int {
 // ---- Persistence helpers -------------------------------------------------------
 
 // save serializes the tree to disk atomically via a tmp file.
+// File format: [version:1] [unique:1] [reserved:6] [count:8] [entries...]
 // Caller must hold idx.mu (write lock).
 func (idx *Index) save() error {
 	tmpPath := idx.indexPath() + ".tmp"
@@ -250,8 +251,16 @@ func (idx *Index) save() error {
 	}
 
 	n := idx.tree.Len()
-	var hdr [8]byte
-	binary.LittleEndian.PutUint64(hdr[:], uint64(n))
+	var hdr [16]byte
+	hdr[0] = 1 // version
+	if idx.unique {
+		hdr[1] = 1
+	} else {
+		hdr[1] = 0
+	}
+	// hdr[2:8] reserved for future use
+	binary.LittleEndian.PutUint64(hdr[8:], uint64(n)) // entry count
+
 	if _, err := f.Write(hdr[:]); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpPath)
@@ -297,11 +306,18 @@ func (idx *Index) load() error {
 	}
 	defer f.Close()
 
-	var hdr [8]byte
+	var hdr [16]byte
 	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		return fmt.Errorf("read header: %w", err)
 	}
-	n := binary.LittleEndian.Uint64(hdr[:])
+
+	version := hdr[0]
+	if version != 1 {
+		return fmt.Errorf("unsupported index format version %d", version)
+	}
+
+	idx.unique = (hdr[1] == 1) // Load unique flag from file
+	n := binary.LittleEndian.Uint64(hdr[8:])
 
 	for i := uint64(0); i < n; i++ {
 		e, err := readEntry(f)

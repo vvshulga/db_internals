@@ -52,6 +52,22 @@ OS file (pread/pwrite, no buffer pool)
 
 Lexer produces typed tokens; parser builds a recursive-descent AST for `SELECT`, `INSERT`, and `CREATE TABLE`. No execution engine connects these to storage yet.
 
+## Durability Model
+
+Write operations are NOT automatically synced to disk. Data is buffered by the OS page cache.
+
+**To ensure durability:**
+- Call `db.Flush()` or `table.Flush()` explicitly
+- Call `db.Close()` which syncs all files before closing
+- In daemon mode, `dbctl stop` triggers `Close()`, ensuring clean shutdown
+
+**What this means:**
+- Normal operation: writes are fast (OS buffered)
+- Process crash: last few writes MAY be lost (OS dependent)
+- Clean shutdown: all data is synced before exit
+
+Future work: Implement Write-Ahead Log (WAL) for crash recovery.
+
 ## Conventions
 
 - All binary encoding is **little-endian**.

@@ -12,6 +12,7 @@ Education project for the DB Internals CS osvita course. Implements an OLTP row-
 - [On-Disk Layout](#on-disk-layout)
 - [Table Manager API](#table-manager-api)
 - [storage\_cli](#storage_cli)
+- [dbserver / dbctl — Daemon Mode](#dbserver--dbctl--daemon-mode)
 - [Demo](#demo)
 - [Running and Recovery](#running-and-recovery)
 - [SQL Frontend](#sql-frontend)
@@ -416,6 +417,141 @@ Specs that contain shell-special characters (`(`, `)`, `?`) must be quoted:
 
 ---
 
+## dbserver / dbctl — Daemon Mode
+
+`dbserver` is a long-running daemon that keeps a single `storage.DB` instance open.
+`dbctl` is the control and client CLI: it manages the daemon's lifecycle and forwards
+storage commands to it over a Unix socket.
+
+The key advantage over `storage_cli` is that the daemon holds the entire B-tree index in
+memory between calls. With `storage_cli` the index is cold-loaded from disk on every
+invocation; with the daemon it stays hot, giving O(log n) lookups with zero startup cost.
+
+### Build
+
+```bash
+go build -o dbserver ./cmd/dbserver/
+go build -o dbctl    ./cmd/dbctl/
+```
+
+Both binaries must live in the same directory. `dbctl start` locates `dbserver` by looking
+next to itself first, then searching `$PATH`.
+
+### Daemon lifecycle
+
+```bash
+# Start the daemon in the background.
+# Creates <dir>/dbserver.sock and <dir>/dbserver.pid.
+# Daemon output is written to <dir>/dbserver.log.
+./dbctl --dir ./data start
+# → dbserver started (pid 1234, log: ./data/dbserver.log)
+
+# Check whether it is running.
+./dbctl --dir ./data status
+# → dbserver is running (pid 1234)
+
+# Restart (stop + start).
+./dbctl --dir ./data restart
+
+# Graceful shutdown (SIGTERM — waits for in-flight requests to finish).
+./dbctl --dir ./data stop
+# → dbserver stopped
+```
+
+**Global flag** — every `dbctl` subcommand accepts:
+
+```
+--dir <path>    database directory (default: ./data)
+```
+
+### Runtime files
+
+| File | Created by | Purpose |
+|---|---|---|
+| `<dir>/dbserver.pid` | `dbserver` | Process ID — used by `dbctl stop` to send SIGTERM |
+| `<dir>/dbserver.sock` | `dbserver` | Unix domain socket — used by all storage commands |
+| `<dir>/dbserver.log` | `dbctl start` | Daemon stdout + stderr |
+
+### Storage commands
+
+Once the daemon is running, all storage commands are forwarded over the socket:
+
+| Command | Syntax | Example |
+|---|---|---|
+| `list-tables` | `list-tables` | `./dbctl list-tables` |
+| `describe` | `describe <table>` | `./dbctl describe users` |
+| `create-table` | `create-table <table> <col:type> ...` | see below |
+| `drop-table` | `drop-table <table>` | `./dbctl drop-table users` |
+| `insert` | `insert <table> <val> ...` | `./dbctl insert users 1 Alice` |
+| `get` | `get <table> <pageID:slotID>` | `./dbctl get users 1:0` |
+| `update` | `update <table> <pageID:slotID> <val> ...` | `./dbctl update users 1:0 1 Bob` |
+| `delete` | `delete <table> <pageID:slotID>` | `./dbctl delete users 1:0` |
+| `scan` | `scan <table>` | `./dbctl scan users` |
+
+Column types and nullable syntax are identical to `storage_cli`. Quote arguments that
+contain shell-special characters:
+
+```bash
+./dbctl --dir ./data create-table employees \
+    id:int \
+    'name:varchar(64)' \
+    dept:int \
+    'salary:double?'
+```
+
+### End-to-end example
+
+```bash
+# Build and start.
+go build -o dbserver ./cmd/dbserver/
+go build -o dbctl    ./cmd/dbctl/
+./dbctl --dir /tmp/mydb start
+
+# DDL.
+./dbctl --dir /tmp/mydb create-table users id:int 'name:varchar(64)'
+
+# DML.
+./dbctl --dir /tmp/mydb insert users 1 Alice
+./dbctl --dir /tmp/mydb insert users 2 Bob
+./dbctl --dir /tmp/mydb scan users
+# → 1:0  id=1  name=Alice
+# → 1:1  id=2  name=Bob
+
+./dbctl --dir /tmp/mydb update users 1:0 99 Alice-Updated
+./dbctl --dir /tmp/mydb delete users 1:1
+./dbctl --dir /tmp/mydb scan users
+# → 1:2  id=99  name=Alice-Updated
+
+# Restart — data survives; daemon re-opens the heap files and index files from disk.
+./dbctl --dir /tmp/mydb restart
+./dbctl --dir /tmp/mydb scan users
+# → 1:2  id=99  name=Alice-Updated
+
+./dbctl --dir /tmp/mydb stop
+```
+
+### Wire protocol
+
+`dbctl` and `dbserver` communicate via newline-delimited JSON on a Unix domain socket.
+Each client connection carries exactly one request/response pair and is then closed.
+
+```
+→ {"cmd":"insert","args":["users","1","Alice"]}\n
+← {"ok":true,"output":"inserted 1:0"}\n
+
+→ {"cmd":"scan","args":["users"]}\n
+← {"ok":true,"output":"1:0  id=1  name=Alice"}\n
+
+→ {"cmd":"insert","args":["missing","1"]}\n
+← {"ok":false,"error":"storage: table \"missing\" not found"}\n
+```
+
+The server accepts concurrent connections; each is handled in its own goroutine.
+`Shutdown` closes the listener and waits for all in-flight handlers before the
+process exits.
+
+---
+
 ## Demo
 
 `demo.sh` is an end-to-end script that walks through the full employee lifecycle using every `storage_cli` command. It serves as both a quick sanity check and a self-documenting example.
@@ -450,7 +586,9 @@ Expected final line: `✓  demo complete`
 
 ### Lifecycle
 
-The storage engine is a **library**, not a daemon. There is no persistent background process:
+The storage engine can be used in two modes:
+
+**Embedded / stateless** (`storage_cli`) — no persistent background process:
 
 ```
 1. OpenDB(dir)       ← read catalog.json, validate directory
@@ -459,9 +597,23 @@ The storage engine is a **library**, not a daemon. There is no persistent backgr
 ```
 
 Each `storage_cli` invocation runs steps 1–3, exits, then the next call repeats from step 1.
-This is safe because every write that completes reaches disk before the process exits:
-`writePage` uses `WriteAt` (no OS buffering beyond the page cache), and `persistCatalog`
-uses an atomic rename.
+
+**Daemon** (`dbserver` / `dbctl`) — a single long-running process:
+
+```
+dbserver start  → OpenDB once, listen on Unix socket
+dbctl <cmd>     → send JSON request → receive JSON response (no startup cost)
+dbctl stop      → SIGTERM → Close() → remove socket and PID files
+```
+
+The daemon keeps heap files and B-tree indexes open between requests, so repeated index
+lookups pay no cold-load cost. Data is flushed to disk when indexes are checkpointed or
+when the daemon is stopped cleanly.
+
+Both modes ensure data consistency on clean shutdown: `Close()` calls `Sync()` on all
+files before exiting. For explicit durability guarantees before shutdown, call `Flush()`.
+Note: A process crash may lose recent writes that were not explicitly flushed (OS page
+cache behavior). Future work will add Write-Ahead Logging (WAL) for crash recovery.
 
 ### Normal restart
 

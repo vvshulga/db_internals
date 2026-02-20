@@ -430,3 +430,70 @@ func TestHeapFile_AllDataTypes(t *testing.T) {
 		t.Errorf("all-types round-trip:\n got  %v\n want %v", got, want)
 	}
 }
+
+// TestHeapFileFlush verifies that Flush() syncs data to disk without closing the file.
+func TestHeapFileFlush(t *testing.T) {
+	dir := t.TempDir()
+	schema := testSchema(t)
+
+	heap, err := OpenHeapFile(dir, "test")
+	if err != nil {
+		t.Fatalf("OpenHeapFile: %v", err)
+	}
+
+	// Insert a row.
+	row := testRow(42, "Alice", 95.5, "test note")
+	rid, err := heap.Insert(schema, row)
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	// Flush should succeed without closing.
+	if err := heap.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// Verify we can still read from the heap (not closed).
+	got, err := heap.Fetch(schema, rid)
+	if err != nil {
+		t.Fatalf("Fetch after flush: %v", err)
+	}
+	if !rowsEq(got, row) {
+		t.Errorf("Fetch after flush:\n got  %v\n want %v", got, row)
+	}
+
+	// Insert another row after flush.
+	row2 := testRow(99, "Bob", 87.3, "")
+	rid2, err := heap.Insert(schema, row2)
+	if err != nil {
+		t.Fatalf("Insert after flush: %v", err)
+	}
+
+	// Close the heap.
+	if err := heap.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen and verify both rows survived.
+	heap2, err := OpenHeapFile(dir, "test")
+	if err != nil {
+		t.Fatalf("OpenHeapFile (reopen): %v", err)
+	}
+	defer heap2.Close()
+
+	got1, err := heap2.Fetch(schema, rid)
+	if err != nil {
+		t.Fatalf("Fetch row 1 after reopen: %v", err)
+	}
+	if !rowsEq(got1, row) {
+		t.Errorf("Fetch row 1 after reopen:\n got  %v\n want %v", got1, row)
+	}
+
+	got2, err := heap2.Fetch(schema, rid2)
+	if err != nil {
+		t.Fatalf("Fetch row 2 after reopen: %v", err)
+	}
+	if !rowsEq(got2, row2) {
+		t.Errorf("Fetch row 2 after reopen:\n got  %v\n want %v", got2, row2)
+	}
+}

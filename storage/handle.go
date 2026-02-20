@@ -262,6 +262,20 @@ func (t *TableHandle) attachIndex(idx *Index) {
 
 // closeHeap shuts down the underlying HeapFile and all open indexes.
 // Called by DB, not callers.
+// Flush syncs the heap and all indexes to disk, ensuring all previous writes
+// are durable.
+func (t *TableHandle) Flush() error {
+	if err := t.heap.Flush(); err != nil {
+		return err
+	}
+	for _, idx := range t.indexes {
+		if err := idx.Checkpoint(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (t *TableHandle) closeHeap() error {
 	var firstErr error
 	for _, idx := range t.indexes {

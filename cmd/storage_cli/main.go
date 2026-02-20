@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/vvshulga/db_internals/internal/cliutil"
 	"github.com/vvshulga/db_internals/storage"
 )
 
@@ -133,7 +134,7 @@ func runDescribe(db *storage.DB, args []string) {
 		strings.Repeat("-", 20), strings.Repeat("-", 16), strings.Repeat("-", 8))
 	for i := 0; i < schema.NumColumns(); i++ {
 		col := schema.Column(i)
-		fmt.Printf("%-20s  %-16s  %v\n", col.Name, formatType(col), col.Nullable)
+		fmt.Printf("%-20s  %-16s  %v\n", col.Name, cliutil.FormatType(col), col.Nullable)
 	}
 }
 
@@ -146,7 +147,7 @@ func runCreateTable(db *storage.DB, args []string) {
 	name, specs := args[0], args[1:]
 	cols := make([]storage.Column, len(specs))
 	for i, spec := range specs {
-		col, err := parseColSpec(spec)
+		col, err := cliutil.ParseColSpec(spec)
 		if err != nil {
 			fatal("create-table: %v", err)
 		}
@@ -184,7 +185,7 @@ func runInsert(db *storage.DB, args []string) {
 	if err != nil {
 		fatal("insert: %v", err)
 	}
-	row, err := parseValues(tbl.Schema(), args[1:])
+	row, err := cliutil.ParseValues(tbl.Schema(), args[1:])
 	if err != nil {
 		fatal("insert: %v", err)
 	}
@@ -205,7 +206,7 @@ func runGet(db *storage.DB, args []string) {
 	if err != nil {
 		fatal("get: %v", err)
 	}
-	rid, err := parseRID(args[1])
+	rid, err := cliutil.ParseRID(args[1])
 	if err != nil {
 		fatal("get: %v", err)
 	}
@@ -217,7 +218,7 @@ func runGet(db *storage.DB, args []string) {
 		fmt.Println("not found")
 		return
 	}
-	fmt.Printf("%s  %s\n", rid, formatRow(tbl.Schema(), row))
+	fmt.Printf("%s  %s\n", rid, cliutil.FormatRow(tbl.Schema(), row))
 }
 
 // ---- update -----------------------------------------------------------------
@@ -230,11 +231,11 @@ func runUpdate(db *storage.DB, args []string) {
 	if err != nil {
 		fatal("update: %v", err)
 	}
-	rid, err := parseRID(args[1])
+	rid, err := cliutil.ParseRID(args[1])
 	if err != nil {
 		fatal("update: %v", err)
 	}
-	row, err := parseValues(tbl.Schema(), args[2:])
+	row, err := cliutil.ParseValues(tbl.Schema(), args[2:])
 	if err != nil {
 		fatal("update: %v", err)
 	}
@@ -259,7 +260,7 @@ func runDelete(db *storage.DB, args []string) {
 	if err != nil {
 		fatal("delete: %v", err)
 	}
-	rid, err := parseRID(args[1])
+	rid, err := cliutil.ParseRID(args[1])
 	if err != nil {
 		fatal("delete: %v", err)
 	}
@@ -286,7 +287,7 @@ func runScan(db *storage.DB, args []string) {
 	}
 	s := tbl.Scan()
 	for s.Next() {
-		fmt.Printf("%s  %s\n", s.RID(), formatRow(tbl.Schema(), s.Row()))
+		fmt.Printf("%s  %s\n", s.RID(), cliutil.FormatRow(tbl.Schema(), s.Row()))
 	}
 	if err := s.Err(); err != nil {
 		fatal("scan: %v", err)
