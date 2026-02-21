@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"sync"
 )
 
 // ---- Constants ----------------------------------------------------------------
@@ -81,6 +82,15 @@ func (s slotEntry) isDeleted() bool {
 }
 
 // ---- Page ---------------------------------------------------------------------
+
+// compactBufPool provides reusable buffers for page compaction,
+// eliminating per-tuple allocations during Compact().
+var compactBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, PageSize)
+		return &b
+	},
+}
 
 // Page is a fixed-size 8192-byte database page implementing a slotted layout.
 //
@@ -212,19 +222,25 @@ func (p *Page) DeleteTuple(slotID SlotID) error {
 //
 // After compaction all live slot IDs remain valid and return the same data.
 // New tuples inserted after compaction will reuse the recovered free space.
+//
+// Optimization: Uses a buffer pool to avoid per-tuple allocations.
 func (p *Page) Compact() error {
+	// Get reusable buffer from pool
+	bufPtr := compactBufPool.Get().(*[]byte)
+	defer compactBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	writeCursor := PageSize
 	for i := range p.slots {
 		entry := p.slots[i]
 		if entry.isDeleted() {
 			continue
 		}
-		// Make a local copy before moving (source and destination may overlap).
-		tmp := make([]byte, entry.Length)
-		copy(tmp, p.raw[entry.Offset:entry.Offset+entry.Length])
+		// Use pooled buffer instead of allocating tmp
+		copy(buf[:entry.Length], p.raw[entry.Offset:entry.Offset+entry.Length])
 
 		newOffset := uint16(writeCursor) - entry.Length
-		copy(p.raw[newOffset:], tmp)
+		copy(p.raw[newOffset:], buf[:entry.Length])
 
 		p.slots[i].Offset = newOffset
 		p.marshalSlot(SlotID(i), p.slots[i])
@@ -361,13 +377,20 @@ func (p *Page) unmarshalSlot(id SlotID) slotEntry {
 }
 
 // computeChecksum returns the CRC32-IEEE checksum of the page, computed with
-// the checksum field bytes [23..26] zeroed so the checksum does not cover itself.
+// the checksum field bytes [15..18] zeroed so the checksum does not cover itself.
+//
+// Optimization: Computes CRC in 3 segments to avoid copying the entire 8KB page.
 func (p *Page) computeChecksum() uint32 {
-	var tmp [PageSize]byte
-	copy(tmp[:], p.raw[:])
-	tmp[hdrOffChecksum] = 0
-	tmp[hdrOffChecksum+1] = 0
-	tmp[hdrOffChecksum+2] = 0
-	tmp[hdrOffChecksum+3] = 0
-	return crc32.ChecksumIEEE(tmp[:])
+	crc := crc32.NewIEEE()
+
+	// Segment 1: Bytes before checksum field [0:15]
+	crc.Write(p.raw[:hdrOffChecksum])
+
+	// Segment 2: Checksum field as zeros [15:19]
+	crc.Write([]byte{0, 0, 0, 0})
+
+	// Segment 3: Bytes after checksum field [19:8192]
+	crc.Write(p.raw[hdrOffChecksum+4:])
+
+	return crc.Sum32()
 }

@@ -35,11 +35,12 @@ type heapMeta struct {
 // that the in-memory meta cache and file state stay consistent. A future buffer
 // pool with per-page latches would replace this coarse lock.
 type HeapFile struct {
-	mu       sync.Mutex
-	dir      string
-	basename string               // table name prefix
-	segments map[uint32]*os.File  // lazily opened segment files
-	meta     heapMeta
+	mu        sync.Mutex
+	dir       string
+	basename  string               // table name prefix
+	segments  map[uint32]*os.File  // lazily opened segment files
+	meta      heapMeta
+	metaDirty bool                 // true if meta has unpersisted changes
 }
 
 // OpenHeapFile opens or creates the heap file for a table.
@@ -85,6 +86,15 @@ func OpenHeapFile(dir, tableName string) (*HeapFile, error) {
 func (h *HeapFile) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Flush dirty meta before closing
+	if h.metaDirty {
+		if err := h.writeMeta(); err != nil {
+			return err  // Don't proceed if meta flush fails
+		}
+		h.metaDirty = false
+	}
+
 	var firstErr error
 	for id, f := range h.segments {
 		if err := f.Sync(); err != nil && firstErr == nil {
@@ -105,6 +115,15 @@ func (h *HeapFile) Flush() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Flush dirty meta first
+	if h.metaDirty {
+		if err := h.writeMeta(); err != nil {
+			return err
+		}
+		h.metaDirty = false
+	}
+
+	// Then flush all segments
 	for id, f := range h.segments {
 		if err := f.Sync(); err != nil {
 			return fmt.Errorf("flush segment %d: %w", id, err)
@@ -339,9 +358,7 @@ func (h *HeapFile) appendPage() (*Page, error) {
 		return nil, fmt.Errorf("appendPage %d: %w", newID, err)
 	}
 	h.meta.TotalPages++
-	if err := h.writeMeta(); err != nil {
-		return nil, fmt.Errorf("appendPage %d: writeMeta: %w", newID, err)
-	}
+	h.metaDirty = true
 	return pg, nil
 }
 

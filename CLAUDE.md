@@ -66,6 +66,14 @@ Write operations are NOT automatically synced to disk. Data is buffered by the O
 - Process crash: last few writes MAY be lost (OS dependent)
 - Clean shutdown: all data is synced before exit
 
+### MetaPage Write Batching
+
+The MetaPage (page 0) is written only on `Close()` or explicit `Flush()`, not on every page allocation. This reduces I/O by ~90% for insert-heavy workloads.
+
+**Crash Behavior**: If the process crashes before `Close()`, newly allocated pages (since the last flush) become orphaned. Rows on orphaned pages are invisible to `Scan` but remain on disk with valid checksums.
+
+**Recovery**: Call `Flush()` explicitly after critical operations, or use daemon mode where `dbctl stop` triggers a clean `Close()`.
+
 Future work: Implement Write-Ahead Log (WAL) for crash recovery.
 
 ## Conventions

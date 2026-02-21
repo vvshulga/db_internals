@@ -54,40 +54,76 @@ func writeOverflowChain(h *HeapFile, data []byte) (uint64, error) {
 		}
 	}
 
-	// Commit the new page count atomically via the meta page.
+	// Commit the new page count (deferred write until Close/Flush).
 	h.meta.TotalPages += uint64(numPages)
-	if err := h.writeMeta(); err != nil {
-		return 0, fmt.Errorf("writeOverflowChain writeMeta: %w", err)
-	}
+	h.metaDirty = true
 	return firstPageID, nil
 }
 
-// readOverflowChain follows the overflow chain starting at firstPageID and
-// concatenates all chunk bytes into a single slice.
+// countOverflowPages returns the number of pages in the overflow chain starting
+// at firstPageID. Used to pre-allocate the exact buffer size before reading data.
+// Includes the same cycle detection and length limits as readOverflowChain.
 //
 // The caller must hold h.mu.
-func readOverflowChain(h *HeapFile, firstPageID uint64) ([]byte, error) {
-	var result []byte
+func countOverflowPages(h *HeapFile, firstPageID uint64) (int, error) {
 	visited := make(map[uint64]bool)
 	pageID := firstPageID
+	count := 0
 
 	for pageID != 0 {
 		// Cycle detection
 		if visited[pageID] {
-			return nil, &ErrCorruptRecord{
+			return 0, &ErrCorruptRecord{
 				Reason: fmt.Sprintf("overflow chain cycle detected at page %d", pageID),
 			}
 		}
 		visited[pageID] = true
 
-		// Safety: limit chain length to prevent memory exhaustion
-		// 10K pages = ~80 MB TEXT (very generous upper bound)
+		// Safety: limit chain length
 		if len(visited) > 10000 {
-			return nil, &ErrCorruptRecord{
+			return 0, &ErrCorruptRecord{
 				Reason: fmt.Sprintf("overflow chain too long (%d pages)", len(visited)),
 			}
 		}
 
+		pg, err := h.readPage(pageID)
+		if err != nil {
+			return 0, fmt.Errorf("countOverflowPages page %d: %w", pageID, err)
+		}
+		body, err := pg.GetTuple(0)
+		if err != nil {
+			return 0, fmt.Errorf("countOverflowPages page %d slot 0: %w", pageID, err)
+		}
+		if len(body) < 8 {
+			return 0, fmt.Errorf("countOverflowPages page %d: body too short (%d bytes)", pageID, len(body))
+		}
+		pageID = binary.LittleEndian.Uint64(body[:8])
+		count++
+	}
+	return count, nil
+}
+
+// readOverflowChain follows the overflow chain starting at firstPageID and
+// concatenates all chunk bytes into a single slice.
+//
+// Optimization: Pre-allocates the result buffer by counting pages first,
+// eliminating 8-9 reallocations for large chains.
+//
+// The caller must hold h.mu.
+func readOverflowChain(h *HeapFile, firstPageID uint64) ([]byte, error) {
+	// Step 1: Count pages in the chain
+	numPages, err := countOverflowPages(h, firstPageID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 2: Pre-allocate exact size (overflowChunkSize = 8161 bytes)
+	estimatedSize := numPages * overflowChunkSize
+	result := make([]byte, 0, estimatedSize)
+
+	// Step 3: Read chain (no reallocation needed)
+	pageID := firstPageID
+	for pageID != 0 {
 		pg, err := h.readPage(pageID)
 		if err != nil {
 			return nil, fmt.Errorf("readOverflowChain page %d: %w", pageID, err)

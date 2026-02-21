@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash/crc32"
 	"testing"
 )
 
@@ -566,6 +568,60 @@ func TestChecksum(t *testing.T) {
 	})
 }
 
+// TestChecksum_Equivalence verifies that the optimized three-segment CRC
+// computation produces identical results to the old full-copy implementation.
+func TestChecksum_Equivalence(t *testing.T) {
+	// Old implementation (for comparison)
+	computeChecksumOld := func(p *Page) uint32 {
+		var tmp [PageSize]byte
+		copy(tmp[:], p.raw[:])
+		tmp[hdrOffChecksum] = 0
+		tmp[hdrOffChecksum+1] = 0
+		tmp[hdrOffChecksum+2] = 0
+		tmp[hdrOffChecksum+3] = 0
+		return crc32.ChecksumIEEE(tmp[:])
+	}
+
+	// Test with empty page
+	t.Run("empty page", func(t *testing.T) {
+		pg := NewPage(123, DataPage)
+		old := computeChecksumOld(pg)
+		new := pg.computeChecksum()
+
+		if old != new {
+			t.Errorf("checksum mismatch on empty page: old=%d new=%d", old, new)
+		}
+	})
+
+	// Test with single tuple
+	t.Run("single tuple", func(t *testing.T) {
+		pg := NewPage(456, DataPage)
+		pg.InsertTuple([]byte("test data 1"))
+
+		old := computeChecksumOld(pg)
+		new := pg.computeChecksum()
+
+		if old != new {
+			t.Errorf("checksum mismatch with single tuple: old=%d new=%d", old, new)
+		}
+	})
+
+	// Test with multiple tuples
+	t.Run("multiple tuples", func(t *testing.T) {
+		pg := NewPage(789, DataPage)
+		pg.InsertTuple([]byte("test data 1"))
+		pg.InsertTuple([]byte("test data 2"))
+		pg.InsertTuple([]byte("longer test data string here"))
+
+		old := computeChecksumOld(pg)
+		new := pg.computeChecksum()
+
+		if old != new {
+			t.Errorf("checksum mismatch with multiple tuples: old=%d new=%d", old, new)
+		}
+	})
+}
+
 // ---- TestSlotIDStability -----------------------------------------------------
 
 func TestSlotIDStability(t *testing.T) {
@@ -712,4 +768,45 @@ func crc32ChecksumIEEE(data []byte) uint32 {
 	p := &Page{}
 	copy(p.raw[:], data)
 	return p.computeChecksum()
+}
+
+// ---- benchmarks --------------------------------------------------------------
+
+// BenchmarkCompact measures the performance of page compaction with varying
+// numbers of live tuples, verifying that buffer pooling eliminates per-tuple
+// allocations.
+func BenchmarkCompact(b *testing.B) {
+	testCases := []struct {
+		nTuples int
+		data    []byte
+	}{
+		{10, []byte("test data 1234567890")},     // 21 bytes × 10 = 210 bytes
+		{100, []byte("test data 1234567890")},    // 21 bytes × 100 = 2.1 KB
+		{1000, []byte("xy")},                      // 2 bytes × 1000 = 2 KB (fits with slots)
+	}
+
+	for _, tc := range testCases {
+		b.Run(fmt.Sprintf("tuples=%d", tc.nTuples), func(b *testing.B) {
+			pg := NewPage(1, DataPage)
+			for i := 0; i < tc.nTuples; i++ {
+				_, err := pg.InsertTuple(tc.data)
+				if err != nil {
+					b.Fatalf("InsertTuple: %v", err)
+				}
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				// Create a copy to restore state between iterations
+				pgCopy := *pg
+				b.StartTimer()
+
+				if err := pgCopy.Compact(); err != nil {
+					b.Fatalf("Compact: %v", err)
+				}
+			}
+		})
+	}
 }

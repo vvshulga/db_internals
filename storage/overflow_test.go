@@ -592,3 +592,28 @@ func BenchmarkOverflowScan(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkOverflowRead measures allocation reduction in overflow chain reading
+// for varying chain lengths, verifying that pre-allocation eliminates repeated
+// allocations.
+func BenchmarkOverflowRead(b *testing.B) {
+	for _, numPages := range []int{1, 10, 100} {
+		size := numPages * overflowChunkSize
+		b.Run(fmt.Sprintf("pages=%d", numPages), func(b *testing.B) {
+			tbl := openBenchOverflowTable(b)
+			text := bigText(size)
+			rid, err := tbl.Insert(Row{NewIntValue(1), NewTextValue(text)})
+			if err != nil {
+				b.Fatalf("Insert: %v", err)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, _, err := tbl.Get(rid); err != nil {
+					b.Fatalf("Get: %v", err)
+				}
+			}
+		})
+	}
+}
