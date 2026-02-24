@@ -37,10 +37,20 @@ var keywords = map[string]bool{
 	"and":    true,
 	"or":     true,
 	"null":   true,
+	"set":    true,
 
 	"update": true,
 	"delete": true,
 	"drop":   true,
+	"group":  true,
+	"by":     true,
+
+	// Aggregate functions
+	"count": true,
+	"sum":   true,
+	"avg":   true,
+	"min":   true,
+	"max":   true,
 }
 
 var operators = map[string]bool{
@@ -96,7 +106,6 @@ func Tokenize(input string) []Token {
 			if current.Len() > 0 {
 				tokens = append(tokens, createToken(current.String()))
 				current.Reset()
-				i++
 			}
 			if i+1 < inputLength && isOperator(input[i:i+2]) {
 				tokens = append(tokens, Token{Type: TokenOperator, Value: input[i : i+2]})

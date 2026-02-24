@@ -11,17 +11,19 @@ import (
 // AstNode represents a top-level statement
 type AstNode interface{}
 
-// SelectStmt: SELECT projections FROM table [WHERE selection] [LIMIT limit]
+// SelectStmt: SELECT projections FROM table [WHERE selection] [GROUP BY columns] [LIMIT limit]
 type SelectStmt struct {
 	Projections []ProjectionItem // columns list or *
 	From        TableRef         // 1 table
 	Selection   Expr             // WHERE clause (optional)
+	GroupBy     []string         // GROUP BY columns (optional)
 	Limit       *uint64          // LIMIT (optional)
 }
 
 type ProjectionItem struct {
-	All    bool
-	Column string
+	All       bool
+	Column    string
+	Aggregate *AggregateFunctionCall // Non-nil if this is an aggregate function
 }
 
 type TableRef struct {
@@ -43,6 +45,26 @@ type CreateTableStmt struct {
 type ColumnDef struct {
 	Name string
 	Type string
+}
+
+// UpdateStmt: UPDATE table SET col1=expr1, col2=expr2 [WHERE selection] [LIMIT limit]
+type UpdateStmt struct {
+	TableName string
+	SetItems  []SetItem // column assignments
+	Selection Expr      // WHERE clause (optional)
+	Limit     *uint64   // LIMIT (optional)
+}
+
+type SetItem struct {
+	Column string
+	Value  Expr // Reuse Expr types: LiteralInt, LiteralString, ColumnRef
+}
+
+// DeleteStmt: DELETE FROM table [WHERE selection] [LIMIT limit]
+type DeleteStmt struct {
+	TableName string
+	Selection Expr    // WHERE clause (optional)
+	Limit     *uint64 // LIMIT (optional)
 }
 
 // Expr represents expressions in WHERE clauses and VALUES
@@ -76,6 +98,13 @@ type ComparisonOp struct {
 	Left  Expr
 	Op    string
 	Right Expr
+}
+
+// AggregateFunctionCall represents aggregate functions like COUNT, SUM, AVG, MIN, MAX
+type AggregateFunctionCall struct {
+	Function string // COUNT, SUM, AVG, MIN, MAX
+	Argument Expr   // Column reference or * for COUNT(*)
+	IsStar   bool   // True for COUNT(*)
 }
 
 // ParseString tokenizes and parses input into AST nodes
@@ -164,6 +193,10 @@ func (p *parser) parseStatement() (AstNode, error) {
 			return p.parseInsert()
 		case "CREATE":
 			return p.parseCreateTable()
+		case "UPDATE":
+			return p.parseUpdate()
+		case "DELETE":
+			return p.parseDelete()
 		}
 	}
 	return nil, fmt.Errorf("unsupported statement starting with %v", t.Value)
@@ -183,11 +216,30 @@ func (p *parser) parseSelect() (AstNode, error) {
 	} else {
 		for {
 			t := p.peek()
-			if t == nil || t.Type != lexer.TokenIdentifier {
-				return nil, fmt.Errorf("expected projection identifier, got %v", t)
+			if t == nil {
+				return nil, fmt.Errorf("unexpected end of input in projection list")
 			}
-			proj = append(proj, ProjectionItem{All: false, Column: t.Value})
-			p.next()
+
+			// Check if this is an aggregate function
+			if t.Type == lexer.TokenKeyword {
+				funcName := strings.ToUpper(t.Value)
+				if funcName == "COUNT" || funcName == "SUM" || funcName == "AVG" || funcName == "MIN" || funcName == "MAX" {
+					aggCall, err := p.parseAggregateFunction()
+					if err != nil {
+						return nil, err
+					}
+					proj = append(proj, ProjectionItem{Aggregate: aggCall})
+				} else {
+					return nil, fmt.Errorf("unexpected keyword in projection: %s", t.Value)
+				}
+			} else if t.Type == lexer.TokenIdentifier {
+				// Regular column reference
+				proj = append(proj, ProjectionItem{Column: t.Value})
+				p.next()
+			} else {
+				return nil, fmt.Errorf("expected projection identifier or aggregate function, got %v", t)
+			}
+
 			if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "," {
 				p.next()
 				continue
@@ -214,6 +266,30 @@ func (p *parser) parseSelect() (AstNode, error) {
 		}
 		selection = expr
 	}
+	// optional GROUP BY
+	var groupBy []string
+	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "GROUP") {
+		p.next() // consume GROUP
+		if p.peek() == nil || p.peek().Type != lexer.TokenKeyword || !strings.EqualFold(p.peek().Value, "BY") {
+			return nil, fmt.Errorf("expected BY after GROUP")
+		}
+		p.next() // consume BY
+
+		// Parse comma-separated column list
+		for {
+			if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+				return nil, fmt.Errorf("expected column name in GROUP BY")
+			}
+			groupBy = append(groupBy, p.next().Value)
+
+			// Check for comma (continue) or end of GROUP BY clause
+			if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "," {
+				p.next() // consume comma
+				continue
+			}
+			break
+		}
+	}
 	// optional LIMIT
 	var limit *uint64
 	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "LIMIT") {
@@ -228,7 +304,51 @@ func (p *parser) parseSelect() (AstNode, error) {
 		}
 		limit = &u
 	}
-	return &SelectStmt{Projections: proj, From: TableRef{Name: table}, Selection: selection, Limit: limit}, nil
+	return &SelectStmt{Projections: proj, From: TableRef{Name: table}, Selection: selection, GroupBy: groupBy, Limit: limit}, nil
+}
+
+// parseAggregateFunction parses aggregate function calls like COUNT(*), SUM(col), AVG(col)
+func (p *parser) parseAggregateFunction() (*AggregateFunctionCall, error) {
+	if p.peek() == nil || p.peek().Type != lexer.TokenKeyword {
+		return nil, fmt.Errorf("expected aggregate function keyword")
+	}
+
+	funcName := strings.ToUpper(p.next().Value)
+
+	// Expect opening parenthesis
+	if p.peek() == nil || p.peek().Type != lexer.TokenSeparator || p.peek().Value != "(" {
+		return nil, fmt.Errorf("expected '(' after %s", funcName)
+	}
+	p.next()
+
+	// Parse argument
+	aggCall := &AggregateFunctionCall{Function: funcName}
+
+	// Check for COUNT(*)
+	if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "*" {
+		if funcName != "COUNT" {
+			return nil, fmt.Errorf("only COUNT can use *, not %s", funcName)
+		}
+		aggCall.IsStar = true
+		aggCall.Argument = nil
+		p.next()
+	} else {
+		// Parse column reference
+		if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+			return nil, fmt.Errorf("expected column name in %s()", funcName)
+		}
+		colName := p.next().Value
+		aggCall.Argument = &ColumnRef{Name: colName}
+		aggCall.IsStar = false
+	}
+
+	// Expect closing parenthesis
+	if p.peek() == nil || p.peek().Type != lexer.TokenSeparator || p.peek().Value != ")" {
+		return nil, fmt.Errorf("expected ')' after %s argument", funcName)
+	}
+	p.next()
+
+	return aggCall, nil
 }
 
 // parseLogical handles expressions joined by AND/OR
@@ -419,6 +539,156 @@ func (p *parser) parseCreateTable() (AstNode, error) {
 	return &CreateTableStmt{TableName: table, Columns: cols}, nil
 }
 
+func (p *parser) parseUpdate() (AstNode, error) {
+	// consume UPDATE
+	p.next()
+
+	// table name
+	if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected table name after UPDATE")
+	}
+	table := p.next().Value
+
+	// SET keyword
+	if err := p.expectKeyword("SET"); err != nil {
+		return nil, err
+	}
+
+	// SET items: col1=val1, col2=val2, ...
+	var setItems []SetItem
+	for {
+		// column name
+		if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+			return nil, fmt.Errorf("expected column name in SET clause")
+		}
+		colName := p.next().Value
+
+		// = operator
+		if p.peek() == nil || p.peek().Type != lexer.TokenOperator || p.peek().Value != "=" {
+			return nil, fmt.Errorf("expected '=' after column name in SET clause")
+		}
+		p.next()
+
+		// value expression (literal or column ref)
+		var valueExpr Expr
+		if p.peek() == nil {
+			return nil, fmt.Errorf("unexpected EOF after '=' in SET clause")
+		}
+		switch p.peek().Type {
+		case lexer.TokenNumber:
+			v := p.next().Value
+			if strings.Contains(v, ".") {
+				v = strings.SplitN(v, ".", 2)[0]
+			}
+			u, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			valueExpr = &LiteralInt{Value: u}
+		case lexer.TokenString:
+			valueExpr = &LiteralString{Value: p.next().Value}
+		case lexer.TokenIdentifier:
+			valueExpr = &ColumnRef{Name: p.next().Value}
+		default:
+			return nil, fmt.Errorf("expected literal or identifier in SET clause, got %v", p.peek())
+		}
+
+		setItems = append(setItems, SetItem{Column: colName, Value: valueExpr})
+
+		// check for comma (more SET items)
+		if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "," {
+			p.next()
+			continue
+		}
+		break
+	}
+
+	if len(setItems) == 0 {
+		return nil, fmt.Errorf("UPDATE requires at least one SET item")
+	}
+
+	// optional WHERE
+	var selection Expr
+	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "WHERE") {
+		p.next()
+		expr, err := p.parseLogical()
+		if err != nil {
+			return nil, err
+		}
+		selection = expr
+	}
+
+	// optional LIMIT
+	var limit *uint64
+	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "LIMIT") {
+		p.next()
+		if p.peek() == nil || p.peek().Type != lexer.TokenNumber {
+			return nil, fmt.Errorf("expected number after LIMIT")
+		}
+		v := p.next().Value
+		u, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		limit = &u
+	}
+
+	return &UpdateStmt{
+		TableName: table,
+		SetItems:  setItems,
+		Selection: selection,
+		Limit:     limit,
+	}, nil
+}
+
+func (p *parser) parseDelete() (AstNode, error) {
+	// consume DELETE
+	p.next()
+
+	// FROM keyword
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+
+	// table name
+	if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected table name after FROM")
+	}
+	table := p.next().Value
+
+	// optional WHERE
+	var selection Expr
+	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "WHERE") {
+		p.next()
+		expr, err := p.parseLogical()
+		if err != nil {
+			return nil, err
+		}
+		selection = expr
+	}
+
+	// optional LIMIT
+	var limit *uint64
+	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "LIMIT") {
+		p.next()
+		if p.peek() == nil || p.peek().Type != lexer.TokenNumber {
+			return nil, fmt.Errorf("expected number after LIMIT")
+		}
+		v := p.next().Value
+		u, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		limit = &u
+	}
+
+	return &DeleteStmt{
+		TableName: table,
+		Selection: selection,
+		Limit:     limit,
+	}, nil
+}
+
 // PrintAST returns a human-readable representation of the AST nodes.
 func PrintAST(nodes []AstNode) string {
 	var b strings.Builder
@@ -431,6 +701,10 @@ func PrintAST(nodes []AstNode) string {
 			b.WriteString(formatInsert(node, "  "))
 		case *CreateTableStmt:
 			b.WriteString(formatCreateTable(node, "  "))
+		case *UpdateStmt:
+			b.WriteString(formatUpdate(node, "  "))
+		case *DeleteStmt:
+			b.WriteString(formatDelete(node, "  "))
 		}
 	}
 	return b.String()
@@ -451,6 +725,9 @@ func formatSelect(s *SelectStmt, indent string) string {
 	if s.Selection != nil {
 		b.WriteString(indent + "  WHERE:\n")
 		b.WriteString(formatExpr(s.Selection, indent+"    ") + "\n")
+	}
+	if len(s.GroupBy) > 0 {
+		b.WriteString(indent + "  GROUP BY: " + strings.Join(s.GroupBy, ", ") + "\n")
 	}
 	if s.Limit != nil {
 		b.WriteString(fmt.Sprintf(indent+"  LIMIT: %d\n", *s.Limit))
@@ -475,6 +752,36 @@ func formatCreateTable(ct *CreateTableStmt, indent string) string {
 	b.WriteString(indent + "  Columns:\n")
 	for _, c := range ct.Columns {
 		b.WriteString(indent + "    " + c.Name + " " + c.Type + "\n")
+	}
+	return b.String()
+}
+
+func formatUpdate(u *UpdateStmt, indent string) string {
+	var b strings.Builder
+	b.WriteString(indent + "UPDATE " + u.TableName + "\n")
+	b.WriteString(indent + "  SET:\n")
+	for _, item := range u.SetItems {
+		b.WriteString(indent + "    " + item.Column + " = " + formatExprInline(item.Value) + "\n")
+	}
+	if u.Selection != nil {
+		b.WriteString(indent + "  WHERE:\n")
+		b.WriteString(formatExpr(u.Selection, indent+"    ") + "\n")
+	}
+	if u.Limit != nil {
+		b.WriteString(fmt.Sprintf(indent+"  LIMIT: %d\n", *u.Limit))
+	}
+	return b.String()
+}
+
+func formatDelete(d *DeleteStmt, indent string) string {
+	var b strings.Builder
+	b.WriteString(indent + "DELETE FROM " + d.TableName + "\n")
+	if d.Selection != nil {
+		b.WriteString(indent + "  WHERE:\n")
+		b.WriteString(formatExpr(d.Selection, indent+"    ") + "\n")
+	}
+	if d.Limit != nil {
+		b.WriteString(fmt.Sprintf(indent+"  LIMIT: %d\n", *d.Limit))
 	}
 	return b.String()
 }

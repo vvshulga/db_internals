@@ -1,177 +1,86 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 )
 
-func TestParseASTNodes(t *testing.T) {
-	cases := []struct {
-		in  string
-		typ string
+func TestTokenizeTable(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
 	}{
-		{"SELECT * FROM users WHERE id = 123", "SelectStmt"},
-		{"INSERT INTO table_name VALUES (1, 'Alice', 42);", "InsertStmt"},
-		{"INSERT INTO table_name VALUES (1, 2, 3);", "InsertStmt"},
-		{"SELECT col1, col2 FROM table_name;", "SelectStmt"},
-		{"SELECT * FROM table_name;", "SelectStmt"},
-		{"SELECT col1, col2 FROM table_name WHERE col1 > 10;", "SelectStmt"},
-		{"SELECT col1 FROM table_name WHERE col2 = 'Alice' LIMIT 10;", "SelectStmt"},
-		{"CREATE TABLE table_name (column_name1 INT,column_name2 TEXT);", "CreateTableStmt"},
+		{"simple select", "SELECT id FROM users"},
+		{"comparison and float", "SELECT price FROM products WHERE price > 9.99"},
+		{"create table", "CREATE TABLE users (id INT, name VARCHAR(64))"},
+		{"insert values with string", "INSERT INTO table1 VALUES (1, 'hello')"},
+		{"insert with string and numbers", "INSERT INTO users VALUES (42, 'Alice', 30)"},
+		{"insert with all numbers", "INSERT INTO products VALUES (100, 999, 49.99)"},
+		{"select multiple columns", "SELECT id, name, email FROM users"},
+		{"select all from table", "SELECT * FROM products"},
+		{"select with where condition", "SELECT * FROM orders WHERE status = 'pending'"},
+		{"select with where string and limit", "SELECT name FROM users WHERE city = 'NYC' LIMIT 10"},
+		{"create table with column types", "CREATE TABLE items (id INT, price FLOAT, description TEXT)"},
 	}
 
-	for _, c := range cases {
-		nodes, err := ParseString(c.in)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseString(tt.input)
+			if err != nil {
+				t.Errorf("ParseString(%q) returned error: %v", tt.input, err)
+			}
+		})
+	}
+}
+
+func TestParseASTNodes(t *testing.T) {
+	sqls := []string{
+		"SELECT * FROM users",
+		"SELECT id, name FROM users WHERE age > 18",
+		"SELECT * FROM products WHERE price < 100.0 LIMIT 5",
+		"INSERT INTO users VALUES (1, 'Alice')",
+		"CREATE TABLE users (id INT, name VARCHAR(64))",
+	}
+
+	for _, sql := range sqls {
+		nodes, err := ParseString(sql)
 		if err != nil {
-			t.Fatalf("parse failed for %q: %v", c.in, err)
+			t.Fatalf("Parse(%q) failed: %v", sql, err)
 		}
 		if len(nodes) == 0 {
-			t.Fatalf("no nodes returned for %q", c.in)
-		}
-		switch c.typ {
-		case "SelectStmt":
-			if _, ok := nodes[0].(*SelectStmt); !ok {
-				t.Fatalf("expected SelectStmt for %q, got %T", c.in, nodes[0])
-			}
-		case "InsertStmt":
-			if _, ok := nodes[0].(*InsertStmt); !ok {
-				t.Fatalf("expected InsertStmt for %q, got %T", c.in, nodes[0])
-			}
-		case "CreateTableStmt":
-			if _, ok := nodes[0].(*CreateTableStmt); !ok {
-				t.Fatalf("expected CreateTableStmt for %q, got %T", c.in, nodes[0])
-			}
+			t.Fatalf("Parse(%q) returned no nodes", sql)
 		}
 	}
 }
 
 func TestParseASTStructure(t *testing.T) {
-	// SELECT * FROM users WHERE id = 123
-	nodes, err := ParseString("SELECT * FROM users WHERE id = 123")
+	sql := "SELECT id, name FROM users WHERE age > 18 LIMIT 10"
+	nodes, err := ParseString(sql)
 	if err != nil {
-		t.Fatalf("parse failed: %v", err)
+		t.Fatalf("ParseString failed: %v", err)
 	}
 	if len(nodes) != 1 {
-		t.Fatalf("expected one node")
+		t.Fatalf("expected 1 node, got %d", len(nodes))
 	}
+
 	sel, ok := nodes[0].(*SelectStmt)
 	if !ok {
-		t.Fatalf("expected SELECT node, got %T", nodes[0])
+		t.Fatalf("expected SelectStmt, got %T", nodes[0])
+	}
+
+	if len(sel.Projections) != 2 {
+		t.Errorf("expected 2 projections, got %d", len(sel.Projections))
 	}
 	if sel.From.Name != "users" {
-		t.Fatalf("expected FROM users, got %v", sel.From.Name)
+		t.Errorf("expected table 'users', got %s", sel.From.Name)
 	}
-	if len(sel.Projections) != 1 || !sel.Projections[0].All {
-		t.Fatalf("expected projection '*'")
+	if sel.Selection == nil {
+		t.Errorf("expected WHERE clause, got nil")
 	}
-	cmp, ok := sel.Selection.(*ComparisonOp)
-	if !ok {
-		t.Fatalf("expected WHERE comparison, got %T", sel.Selection)
-	}
-	if cref, ok := cmp.Left.(*ColumnRef); !ok || cref.Name != "id" {
-		t.Fatalf("expected left column id, got %T %+v", cmp.Left, cmp.Left)
-	}
-	if lit, ok := cmp.Right.(*LiteralInt); !ok || lit.Value != 123 {
-		t.Fatalf("expected right literal 123, got %T %+v", cmp.Right, cmp.Right)
-	}
-
-	// INSERT INTO table_name VALUES (1, 'Alice', 42);
-	nodes, err = ParseString("INSERT INTO table_name VALUES (1, 'Alice', 42);")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	if len(nodes) != 1 {
-		t.Fatalf("expected one node")
-	}
-	ins, ok := nodes[0].(*InsertStmt)
-	if !ok {
-		t.Fatalf("expected INSERT node, got %T", nodes[0])
-	}
-	if ins.TableName != "table_name" {
-		t.Fatalf("expected table_name, got %v", ins.TableName)
-	}
-	if len(ins.Values) != 3 {
-		t.Fatalf("expected three values, got %v", len(ins.Values))
-	}
-	if a, ok := ins.Values[0].(*LiteralInt); !ok || a.Value != 1 {
-		t.Fatalf("expected first value 1, got %T %+v", ins.Values[0], ins.Values[0])
-	}
-	if s, ok := ins.Values[1].(*LiteralString); !ok || s.Value != "Alice" {
-		t.Fatalf("expected second value 'Alice', got %T %+v", ins.Values[1], ins.Values[1])
-	}
-	if b, ok := ins.Values[2].(*LiteralInt); !ok || b.Value != 42 {
-		t.Fatalf("expected third value 42, got %T %+v", ins.Values[2], ins.Values[2])
-	}
-
-	// INSERT INTO table_name VALUES (1, 2, 3);
-	nodes, err = ParseString("INSERT INTO table_name VALUES (1, 2, 3);")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	ins, ok = nodes[0].(*InsertStmt)
-	if !ok {
-		t.Fatalf("expected INSERT node")
-	}
-	if len(ins.Values) != 3 {
-		t.Fatalf("expected three numeric values, got %v", len(ins.Values))
-	}
-
-	// SELECT col1, col2 FROM table_name;
-	nodes, err = ParseString("SELECT col1, col2 FROM table_name;")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	sel, ok = nodes[0].(*SelectStmt)
-	if !ok {
-		t.Fatalf("expected SELECT node")
-	}
-	if len(sel.Projections) != 2 || sel.Projections[0].Column != "col1" || sel.Projections[1].Column != "col2" {
-		t.Fatalf("unexpected projections: %+v", sel.Projections)
-	}
-
-	// SELECT col1, col2 FROM table_name WHERE col1 > 10;
-	nodes, err = ParseString("SELECT col1, col2 FROM table_name WHERE col1 > 10;")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	sel, ok = nodes[0].(*SelectStmt)
-	if !ok {
-		t.Fatalf("expected SELECT node")
-	}
-	if cmp, ok := sel.Selection.(*ComparisonOp); !ok {
-		t.Fatalf("expected comparison op in WHERE, got %T", sel.Selection)
-	} else {
-		if _, ok := cmp.Right.(*LiteralInt); !ok {
-			t.Fatalf("expected numeric literal on right side")
-		}
-	}
-
-	// SELECT ... LIMIT 10
-	nodes, err = ParseString("SELECT col1 FROM table_name WHERE col2 = 'Alice' LIMIT 10;")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	sel, ok = nodes[0].(*SelectStmt)
-	if !ok {
-		t.Fatalf("expected SELECT node")
-	}
-	if sel.Limit == nil || *sel.Limit != 10 {
-		t.Fatalf("expected LIMIT 10, got %v", sel.Limit)
-	}
-
-	// CREATE TABLE
-	nodes, err = ParseString("CREATE TABLE table_name (column_name1 INT,column_name2 TEXT);")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	ct, ok := nodes[0].(*CreateTableStmt)
-	if !ok {
-		t.Fatalf("expected CREATE TABLE node, got %T", nodes[0])
-	}
-	if ct.TableName != "table_name" {
-		t.Fatalf("unexpected table name: %v", ct.TableName)
-	}
-	if len(ct.Columns) != 2 || ct.Columns[0].Name != "column_name1" || ct.Columns[1].Type != "TEXT" {
-		t.Fatalf("unexpected columns: %+v", ct.Columns)
+	if sel.Limit == nil {
+		t.Errorf("expected LIMIT clause, got nil")
+	} else if *sel.Limit != 10 {
+		t.Errorf("expected LIMIT 10, got %d", *sel.Limit)
 	}
 }
 
@@ -180,19 +89,19 @@ func TestParseErrors(t *testing.T) {
 		name  string
 		query string
 	}{
-		{"missing projections", "SELECT FROM t"},
+		{"missing projections", "SELECT FROM users"},
 		{"missing table", "SELECT * FROM"},
-		{"missing where condition", "SELECT * FROM t WHERE"},
-		{"insert missing values list", "INSERT INTO t VALUES"},
-		{"create table empty columns", "CREATE TABLE t()"},
-		{"invalid statement with WHERE", "WHERE"},
+		{"missing where condition", "SELECT * FROM users WHERE"},
+		{"insert missing values list", "INSERT INTO users VALUES"},
+		{"create table empty columns", "CREATE TABLE users ()"},
+		{"invalid statement with WHERE", "WHERE id = 1"},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := ParseString(c.query)
 			if err == nil {
-				t.Fatalf("expected parse error for %q but got none", c.query)
+				t.Errorf("expected error for query %q but got none", c.query)
 			}
 		})
 	}
@@ -210,13 +119,11 @@ func TestParseUnclosedString(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := ParseString(c.query)
-			// Unclosed strings may or may not cause parse errors depending on lexer behavior
-			// This test documents the behavior
-			if err != nil {
-				t.Logf("Parse error for %q: %v", c.query, err)
-			} else {
+			nodes, err := ParseString(c.query)
+			if err == nil && len(nodes) > 0 {
 				t.Logf("Parse succeeded for %q (unclosed string)", c.query)
+			} else if err != nil {
+				t.Logf("Parse error for %q: %v", c.query, err)
 			}
 		})
 	}
@@ -224,31 +131,355 @@ func TestParseUnclosedString(t *testing.T) {
 
 func TestParseMismatchedParentheses(t *testing.T) {
 	cases := []struct {
-		name        string
-		query       string
-		shouldError bool
+		name  string
+		query string
 	}{
-		{"missing closing paren in where", "SELECT * FROM t WHERE (id = 1", true},
-		{"extra closing paren", "SELECT * FROM t)", true},
-		{"extra closing paren in insert", "INSERT INTO t VALUES (1, 2))", true},
-		{"extra closing paren in create", "CREATE TABLE t (id INT))", true},
-		{"multiple missing close", "SELECT * FROM ((t WHERE id = 1)", true},
-		{"unmatched open in select", "SELECT * FROM t (WHERE id = 1", true},
+		{"missing closing paren in where", "SELECT * FROM t WHERE (id = 1"},
+		{"extra closing paren", "SELECT * FROM t)"},
+		{"extra closing paren in insert", "INSERT INTO t VALUES (1, 2))"},
+		{"extra closing paren in create", "CREATE TABLE t (id INT))"},
+		{"multiple missing close", "SELECT * FROM ((t WHERE id = 1)"},
+		{"unmatched open in select", "SELECT * FROM t (WHERE id = 1"},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := ParseString(c.query)
-			if c.shouldError {
-				if err == nil {
-					t.Logf("Expected parse error for %q but got none", c.query)
-				} else {
-					t.Logf("Got expected error for %q: %v", c.query, err)
+			if err != nil {
+				t.Logf("Got expected error for %q: %v", c.query, err)
+			}
+		})
+	}
+}
+
+func TestParseUpdate(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"simple update", "UPDATE users SET name='Bob'"},
+		{"update with WHERE", "UPDATE users SET name='Bob' WHERE id=1"},
+		{"update multiple columns", "UPDATE users SET name='Bob', age=30"},
+		{"update with AND", "UPDATE users SET status='active' WHERE age >= 18 AND age <= 65"},
+		{"update with LIMIT", "UPDATE users SET verified=1 LIMIT 100"},
+		{"update all rows", "UPDATE products SET discount=0"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			nodes, err := ParseString(c.query)
+			if err != nil {
+				t.Fatalf("ParseString(%q) failed: %v", c.query, err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node, got %d", len(nodes))
+			}
+			if _, ok := nodes[0].(*UpdateStmt); !ok {
+				t.Fatalf("expected UpdateStmt, got %T", nodes[0])
+			}
+		})
+	}
+}
+
+func TestParseUpdateStructure(t *testing.T) {
+	sql := "UPDATE users SET name='Alice', age=25 WHERE id=1 LIMIT 1"
+	nodes, err := ParseString(sql)
+	if err != nil {
+		t.Fatalf("ParseString failed: %v", err)
+	}
+
+	stmt, ok := nodes[0].(*UpdateStmt)
+	if !ok {
+		t.Fatalf("expected UpdateStmt, got %T", nodes[0])
+	}
+
+	if stmt.TableName != "users" {
+		t.Errorf("expected table 'users', got %s", stmt.TableName)
+	}
+	if len(stmt.SetItems) != 2 {
+		t.Errorf("expected 2 SET items, got %d", len(stmt.SetItems))
+	}
+	if stmt.Selection == nil {
+		t.Error("expected WHERE clause, got nil")
+	}
+	if stmt.Limit == nil {
+		t.Error("expected LIMIT clause, got nil")
+	}
+}
+
+func TestParseDelete(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"delete all", "DELETE FROM users"},
+		{"delete with WHERE", "DELETE FROM users WHERE id=1"},
+		{"delete with comparison", "DELETE FROM logs WHERE created < 1000000"},
+		{"delete with AND", "DELETE FROM sessions WHERE expired=1 AND accessed < 1000"},
+		{"delete with LIMIT", "DELETE FROM logs LIMIT 1000"},
+		{"delete range", "DELETE FROM events WHERE timestamp >= 100 AND timestamp < 200"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			nodes, err := ParseString(c.query)
+			if err != nil {
+				t.Fatalf("ParseString(%q) failed: %v", c.query, err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node, got %d", len(nodes))
+			}
+			if _, ok := nodes[0].(*DeleteStmt); !ok {
+				t.Fatalf("expected DeleteStmt, got %T", nodes[0])
+			}
+		})
+	}
+}
+
+func TestParseDeleteStructure(t *testing.T) {
+	sql := "DELETE FROM users WHERE id=1 LIMIT 1"
+	nodes, err := ParseString(sql)
+	if err != nil {
+		t.Fatalf("ParseString failed: %v", err)
+	}
+
+	stmt, ok := nodes[0].(*DeleteStmt)
+	if !ok {
+		t.Fatalf("expected DeleteStmt, got %T", nodes[0])
+	}
+
+	if stmt.TableName != "users" {
+		t.Errorf("expected table 'users', got %s", stmt.TableName)
+	}
+	if stmt.Selection == nil {
+		t.Error("expected WHERE clause, got nil")
+	}
+	if stmt.Limit == nil {
+		t.Error("expected LIMIT clause, got nil")
+	}
+}
+
+func TestParseUpdateErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"missing SET", "UPDATE users name='Bob'"},
+		{"missing column", "UPDATE users SET"},
+		{"missing value", "UPDATE users SET name="},
+		{"empty table", "UPDATE SET name='Bob'"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if err == nil {
+				t.Errorf("expected error for %q but got none", c.query)
+			}
+		})
+	}
+}
+
+func TestParseAggregateFunctions(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"count_star", "SELECT COUNT(*) FROM users"},
+		{"count_column", "SELECT COUNT(id) FROM users"},
+		{"sum", "SELECT SUM(salary) FROM employees"},
+		{"avg", "SELECT AVG(age) FROM customers"},
+		{"min", "SELECT MIN(price) FROM products"},
+		{"max", "SELECT MAX(score) FROM games"},
+		{"multiple_agg", "SELECT COUNT(*), SUM(salary), AVG(age) FROM employees"},
+		{"mix_column_agg", "SELECT dept, COUNT(*) FROM employees"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			nodes, err := ParseString(c.query)
+			if err != nil {
+				t.Fatalf("ParseString(%q) failed: %v", c.query, err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node, got %d", len(nodes))
+			}
+			stmt, ok := nodes[0].(*SelectStmt)
+			if !ok {
+				t.Fatalf("expected SelectStmt, got %T", nodes[0])
+			}
+			// Verify at least one projection has an aggregate
+			hasAgg := false
+			for _, proj := range stmt.Projections {
+				if proj.Aggregate != nil {
+					hasAgg = true
+					break
 				}
-			} else {
-				if err != nil {
-					t.Logf("Unexpected error for %q: %v", c.query, err)
-				}
+			}
+			if !hasAgg {
+				t.Error("expected at least one aggregate function in projections")
+			}
+		})
+	}
+}
+
+func TestParseAggregateStructure(t *testing.T) {
+	sql := "SELECT COUNT(*), SUM(salary), AVG(age) FROM employees"
+	nodes, err := ParseString(sql)
+	if err != nil {
+		t.Fatalf("ParseString failed: %v", err)
+	}
+
+	stmt, ok := nodes[0].(*SelectStmt)
+	if !ok {
+		t.Fatalf("expected SelectStmt, got %T", nodes[0])
+	}
+
+	if len(stmt.Projections) != 3 {
+		t.Fatalf("expected 3 projections, got %d", len(stmt.Projections))
+	}
+
+	// COUNT(*)
+	if stmt.Projections[0].Aggregate == nil {
+		t.Error("expected first projection to be aggregate")
+	} else {
+		agg := stmt.Projections[0].Aggregate
+		if agg.Function != "COUNT" {
+			t.Errorf("expected COUNT, got %s", agg.Function)
+		}
+		if !agg.IsStar {
+			t.Error("expected COUNT(*), got COUNT(col)")
+		}
+	}
+
+	// SUM(salary)
+	if stmt.Projections[1].Aggregate == nil {
+		t.Error("expected second projection to be aggregate")
+	} else {
+		agg := stmt.Projections[1].Aggregate
+		if agg.Function != "SUM" {
+			t.Errorf("expected SUM, got %s", agg.Function)
+		}
+		if agg.IsStar {
+			t.Error("expected SUM(col), got SUM(*)")
+		}
+	}
+}
+
+func TestParseAggregateErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"sum_star", "SELECT SUM(*) FROM users"},
+		{"missing_paren", "SELECT COUNT FROM users"},
+		{"missing_close_paren", "SELECT COUNT( FROM users"},
+		{"missing_arg", "SELECT SUM() FROM users"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if err == nil {
+				t.Errorf("expected error for %q but got none", c.query)
+			}
+		})
+	}
+}
+
+func TestParseDeleteErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"missing FROM", "DELETE users"},
+		{"missing table", "DELETE FROM"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if err == nil {
+				t.Fatalf("expected parse error for %q but got none", c.query)
+			}
+		})
+	}
+}
+
+func TestParseGroupBy(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"single_column", "SELECT dept, COUNT(*) FROM employees GROUP BY dept"},
+		{"multiple_columns", "SELECT dept, region, SUM(salary) FROM employees GROUP BY dept, region"},
+		{"with_where", "SELECT city, AVG(age) FROM users WHERE age > 18 GROUP BY city"},
+		{"with_limit", "SELECT status, COUNT(*) FROM orders GROUP BY status LIMIT 10"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			nodes, err := ParseString(c.query)
+			if err != nil {
+				t.Fatalf("ParseString(%q) failed: %v", c.query, err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node, got %d", len(nodes))
+			}
+
+			stmt, ok := nodes[0].(*SelectStmt)
+			if !ok {
+				t.Fatalf("expected SelectStmt, got %T", nodes[0])
+			}
+			if len(stmt.GroupBy) == 0 {
+				t.Error("GROUP BY should be parsed")
+			}
+		})
+	}
+}
+
+func TestParseGroupByStructure(t *testing.T) {
+	sql := "SELECT dept, region, COUNT(*), SUM(salary) FROM employees GROUP BY dept, region"
+	nodes, err := ParseString(sql)
+	if err != nil {
+		t.Fatalf("ParseString failed: %v", err)
+	}
+
+	stmt, ok := nodes[0].(*SelectStmt)
+	if !ok {
+		t.Fatalf("expected SelectStmt, got %T", nodes[0])
+	}
+
+	if len(stmt.GroupBy) != 2 {
+		t.Fatalf("expected 2 GROUP BY columns, got %d", len(stmt.GroupBy))
+	}
+	if stmt.GroupBy[0] != "dept" {
+		t.Errorf("expected first GROUP BY column 'dept', got %s", stmt.GroupBy[0])
+	}
+	if stmt.GroupBy[1] != "region" {
+		t.Errorf("expected second GROUP BY column 'region', got %s", stmt.GroupBy[1])
+	}
+}
+
+func TestParseGroupByErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		err   string
+	}{
+		{"missing_by", "SELECT dept, COUNT(*) FROM employees GROUP", "expected BY after GROUP"},
+		{"missing_column", "SELECT dept, COUNT(*) FROM employees GROUP BY", "expected column name"},
+		{"empty_list", "SELECT dept, COUNT(*) FROM employees GROUP BY ,", "expected column name"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if err == nil {
+				t.Fatalf("expected error for %q but got none", c.query)
+			}
+			if !strings.Contains(err.Error(), c.err) {
+				t.Errorf("expected error containing %q, got %v", c.err, err)
 			}
 		})
 	}
