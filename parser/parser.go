@@ -11,13 +11,21 @@ import (
 // AstNode represents a top-level statement
 type AstNode interface{}
 
-// SelectStmt: SELECT projections FROM table [WHERE selection] [GROUP BY columns] [LIMIT limit]
+// SelectStmt: SELECT [DISTINCT] projections FROM table [WHERE selection] [GROUP BY columns] [ORDER BY columns] [LIMIT limit]
 type SelectStmt struct {
+	Distinct    bool             // DISTINCT modifier (optional)
 	Projections []ProjectionItem // columns list or *
 	From        TableRef         // 1 table
 	Selection   Expr             // WHERE clause (optional)
 	GroupBy     []string         // GROUP BY columns (optional)
+	OrderBy     []OrderByClause  // ORDER BY columns (optional)
 	Limit       *uint64          // LIMIT (optional)
+}
+
+// OrderByClause represents a single ORDER BY column with direction
+type OrderByClause struct {
+	Column    string // Column name
+	Direction string // "ASC" or "DESC"
 }
 
 type ProjectionItem struct {
@@ -43,8 +51,10 @@ type CreateTableStmt struct {
 }
 
 type ColumnDef struct {
-	Name string
-	Type string
+	Name     string
+	Type     string   // Base type name: "VARCHAR", "INT", "TEXT", etc.
+	TypeLen  *uint16  // Optional length for VARCHAR(N); nil if not specified
+	Nullable bool     // Support for nullable marker (TYPE?)
 }
 
 // UpdateStmt: UPDATE table SET col1=expr1, col2=expr2 [WHERE selection] [LIMIT limit]
@@ -65,6 +75,27 @@ type DeleteStmt struct {
 	TableName string
 	Selection Expr    // WHERE clause (optional)
 	Limit     *uint64 // LIMIT (optional)
+}
+
+// DropTableStmt: DROP TABLE <name>
+type DropTableStmt struct {
+	TableName string
+}
+
+// CreateDatabaseStmt: CREATE DATABASE <name>
+type CreateDatabaseStmt struct {
+	DBName string
+}
+
+// RenameDatabaseStmt: RENAME DATABASE <old> TO <new>
+type RenameDatabaseStmt struct {
+	OldName string
+	NewName string
+}
+
+// DropDatabaseStmt: DROP DATABASE <name>
+type DropDatabaseStmt struct {
+	DBName string
 }
 
 // Expr represents expressions in WHERE clauses and VALUES
@@ -192,11 +223,15 @@ func (p *parser) parseStatement() (AstNode, error) {
 		case "INSERT":
 			return p.parseInsert()
 		case "CREATE":
-			return p.parseCreateTable()
+			return p.parseCreate()
 		case "UPDATE":
 			return p.parseUpdate()
 		case "DELETE":
 			return p.parseDelete()
+		case "DROP":
+			return p.parseDrop()
+		case "RENAME":
+			return p.parseRenameDatabase()
 		}
 	}
 	return nil, fmt.Errorf("unsupported statement starting with %v", t.Value)
@@ -205,6 +240,14 @@ func (p *parser) parseStatement() (AstNode, error) {
 func (p *parser) parseSelect() (AstNode, error) {
 	// consume SELECT
 	p.next()
+
+	// Check for optional DISTINCT keyword
+	distinct := false
+	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "DISTINCT") {
+		p.next() // consume DISTINCT
+		distinct = true
+	}
+
 	proj := []ProjectionItem{}
 	// projection list
 	if p.peek() == nil {
@@ -290,6 +333,49 @@ func (p *parser) parseSelect() (AstNode, error) {
 			break
 		}
 	}
+	// optional ORDER BY
+	var orderBy []OrderByClause
+	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "ORDER") {
+		p.next() // consume ORDER
+		if p.peek() == nil || p.peek().Type != lexer.TokenKeyword || !strings.EqualFold(p.peek().Value, "BY") {
+			return nil, fmt.Errorf("expected BY after ORDER")
+		}
+		p.next() // consume BY
+
+		// Parse comma-separated column list with optional ASC/DESC
+		for {
+			if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+				return nil, fmt.Errorf("expected column name in ORDER BY")
+			}
+			colName := p.next().Value
+
+			// Default to ASC
+			direction := "ASC"
+
+			// Check for explicit ASC/DESC
+			if p.peek() != nil && p.peek().Type == lexer.TokenKeyword {
+				if strings.EqualFold(p.peek().Value, "ASC") {
+					p.next()
+					direction = "ASC"
+				} else if strings.EqualFold(p.peek().Value, "DESC") {
+					p.next()
+					direction = "DESC"
+				}
+			}
+
+			orderBy = append(orderBy, OrderByClause{
+				Column:    colName,
+				Direction: direction,
+			})
+
+			// Check for comma (continue) or end of ORDER BY clause
+			if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "," {
+				p.next() // consume comma
+				continue
+			}
+			break
+		}
+	}
 	// optional LIMIT
 	var limit *uint64
 	if p.peek() != nil && p.peek().Type == lexer.TokenKeyword && strings.EqualFold(p.peek().Value, "LIMIT") {
@@ -304,7 +390,7 @@ func (p *parser) parseSelect() (AstNode, error) {
 		}
 		limit = &u
 	}
-	return &SelectStmt{Projections: proj, From: TableRef{Name: table}, Selection: selection, GroupBy: groupBy, Limit: limit}, nil
+	return &SelectStmt{Distinct: distinct, Projections: proj, From: TableRef{Name: table}, Selection: selection, GroupBy: groupBy, OrderBy: orderBy, Limit: limit}, nil
 }
 
 // parseAggregateFunction parses aggregate function calls like COUNT(*), SUM(col), AVG(col)
@@ -494,9 +580,94 @@ func (p *parser) parseInsert() (AstNode, error) {
 	return &InsertStmt{TableName: table, Values: vals}, nil
 }
 
-func (p *parser) parseCreateTable() (AstNode, error) {
-	// consume CREATE
-	p.next()
+// parseCreate dispatches CREATE TABLE vs CREATE DATABASE.
+func (p *parser) parseCreate() (AstNode, error) {
+	p.next() // consume CREATE
+	t := p.peek()
+	if t == nil {
+		return nil, fmt.Errorf("expected TABLE or DATABASE after CREATE, got eof")
+	}
+	switch strings.ToUpper(t.Value) {
+	case "TABLE":
+		return p.parseCreateTableBody()
+	case "DATABASE":
+		return p.parseCreateDatabaseBody()
+	default:
+		return nil, fmt.Errorf("expected TABLE or DATABASE after CREATE, got %s", t.Value)
+	}
+}
+
+// parseCreateDatabaseBody parses: CREATE DATABASE <name>  (CREATE already consumed)
+func (p *parser) parseCreateDatabaseBody() (AstNode, error) {
+	if err := p.expectKeyword("DATABASE"); err != nil {
+		return nil, err
+	}
+	if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected database name after CREATE DATABASE")
+	}
+	return &CreateDatabaseStmt{DBName: p.next().Value}, nil
+}
+
+// parseDrop dispatches DROP TABLE vs DROP DATABASE.
+func (p *parser) parseDrop() (AstNode, error) {
+	p.next() // consume DROP
+	t := p.peek()
+	if t == nil {
+		return nil, fmt.Errorf("expected TABLE or DATABASE after DROP, got eof")
+	}
+	switch strings.ToUpper(t.Value) {
+	case "TABLE":
+		return p.parseDropTableBody()
+	case "DATABASE":
+		return p.parseDropDatabaseBody()
+	default:
+		return nil, fmt.Errorf("expected TABLE or DATABASE after DROP, got %s", t.Value)
+	}
+}
+
+// parseDropTableBody parses: DROP TABLE <name>  (DROP already consumed)
+func (p *parser) parseDropTableBody() (AstNode, error) {
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, err
+	}
+	if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected table name after DROP TABLE")
+	}
+	return &DropTableStmt{TableName: p.next().Value}, nil
+}
+
+// parseDropDatabaseBody parses: DROP DATABASE <name>  (DROP already consumed)
+func (p *parser) parseDropDatabaseBody() (AstNode, error) {
+	if err := p.expectKeyword("DATABASE"); err != nil {
+		return nil, err
+	}
+	if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected database name after DROP DATABASE")
+	}
+	return &DropDatabaseStmt{DBName: p.next().Value}, nil
+}
+
+// parseRenameDatabase parses: RENAME DATABASE <old> TO <new>
+func (p *parser) parseRenameDatabase() (AstNode, error) {
+	p.next() // consume RENAME
+	if err := p.expectKeyword("DATABASE"); err != nil {
+		return nil, err
+	}
+	if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected database name after RENAME DATABASE")
+	}
+	oldName := p.next().Value
+	if err := p.expectKeyword("TO"); err != nil {
+		return nil, err
+	}
+	if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected new database name after TO")
+	}
+	return &RenameDatabaseStmt{OldName: oldName, NewName: p.next().Value}, nil
+}
+
+// parseCreateTableBody parses: CREATE TABLE <name> (...)  (CREATE already consumed)
+func (p *parser) parseCreateTableBody() (AstNode, error) {
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
@@ -525,11 +696,76 @@ func (p *parser) parseCreateTable() (AstNode, error) {
 			return nil, fmt.Errorf("expected column name, got %v", p.peek())
 		}
 		name := p.next().Value
-		if p.peek() == nil || p.peek().Type != lexer.TokenIdentifier {
+
+		// Parse base type
+		typToken := p.peek()
+		if typToken == nil || typToken.Type != lexer.TokenIdentifier {
 			return nil, fmt.Errorf("expected column type for %s", name)
 		}
-		typ := p.next().Value
-		cols = append(cols, ColumnDef{Name: name, Type: typ})
+		typeStr := p.next().Value
+
+		// Check for nullable marker "?" at the end of the type
+		nullable := false
+		if strings.HasSuffix(typeStr, "?") {
+			nullable = true
+			typeStr = strings.TrimSuffix(typeStr, "?")
+		}
+
+		baseType := strings.ToUpper(typeStr)
+
+		// Check for type length parameter like VARCHAR(N)
+		var typeLen *uint16
+		if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "(" {
+			// Only VARCHAR supports length parameter
+			if baseType != "VARCHAR" {
+				return nil, fmt.Errorf("type %s does not support length parameter", baseType)
+			}
+
+			p.next() // consume '('
+
+			// Expect number token
+			if p.peek() == nil || p.peek().Type != lexer.TokenNumber {
+				return nil, fmt.Errorf("expected numeric length for VARCHAR")
+			}
+
+			lenStr := p.next().Value
+			lenVal, err := strconv.ParseUint(lenStr, 10, 16)
+			if err != nil {
+				return nil, fmt.Errorf("invalid VARCHAR length %q: %v", lenStr, err)
+			}
+
+			// Validate range: 1-65535
+			if lenVal == 0 || lenVal > 65535 {
+				return nil, fmt.Errorf("VARCHAR length must be 1-65535, got %d", lenVal)
+			}
+
+			len16 := uint16(lenVal)
+			typeLen = &len16
+
+			// Expect closing paren
+			if p.peek() == nil || p.peek().Type != lexer.TokenSeparator || p.peek().Value != ")" {
+				return nil, fmt.Errorf("expected ')' after VARCHAR length")
+			}
+			p.next() // consume ')'
+		}
+
+		// Validate VARCHAR has length
+		if baseType == "VARCHAR" && typeLen == nil {
+			return nil, fmt.Errorf("VARCHAR requires length parameter, e.g., VARCHAR(64)")
+		}
+
+		// Check for nullable marker as a separate token (for cases like VARCHAR(N)?)
+		if p.peek() != nil && p.peek().Type == lexer.TokenIdentifier && p.peek().Value == "?" {
+			nullable = true
+			p.next() // consume '?'
+		}
+
+		cols = append(cols, ColumnDef{
+			Name:     name,
+			Type:     baseType,
+			TypeLen:  typeLen,
+			Nullable: nullable,
+		})
 		hasColumns = true
 		if p.peek() != nil && p.peek().Type == lexer.TokenSeparator && p.peek().Value == "," {
 			p.next()
@@ -705,6 +941,14 @@ func PrintAST(nodes []AstNode) string {
 			b.WriteString(formatUpdate(node, "  "))
 		case *DeleteStmt:
 			b.WriteString(formatDelete(node, "  "))
+		case *DropTableStmt:
+			b.WriteString("  DROP TABLE " + node.TableName + "\n")
+		case *CreateDatabaseStmt:
+			b.WriteString("  CREATE DATABASE " + node.DBName + "\n")
+		case *RenameDatabaseStmt:
+			b.WriteString("  RENAME DATABASE " + node.OldName + " TO " + node.NewName + "\n")
+		case *DropDatabaseStmt:
+			b.WriteString("  DROP DATABASE " + node.DBName + "\n")
 		}
 	}
 	return b.String()
@@ -713,6 +957,9 @@ func PrintAST(nodes []AstNode) string {
 func formatSelect(s *SelectStmt, indent string) string {
 	var b strings.Builder
 	b.WriteString(indent + "SELECT\n")
+	if s.Distinct {
+		b.WriteString(indent + "  DISTINCT: true\n")
+	}
 	b.WriteString(indent + "  Projections:\n")
 	for _, p := range s.Projections {
 		if p.All {
@@ -728,6 +975,13 @@ func formatSelect(s *SelectStmt, indent string) string {
 	}
 	if len(s.GroupBy) > 0 {
 		b.WriteString(indent + "  GROUP BY: " + strings.Join(s.GroupBy, ", ") + "\n")
+	}
+	if len(s.OrderBy) > 0 {
+		orderByStrs := make([]string, len(s.OrderBy))
+		for i, ob := range s.OrderBy {
+			orderByStrs[i] = fmt.Sprintf("%s %s", ob.Column, ob.Direction)
+		}
+		b.WriteString(indent + "  ORDER BY: " + strings.Join(orderByStrs, ", ") + "\n")
 	}
 	if s.Limit != nil {
 		b.WriteString(fmt.Sprintf(indent+"  LIMIT: %d\n", *s.Limit))

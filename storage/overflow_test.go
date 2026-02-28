@@ -593,6 +593,158 @@ func BenchmarkOverflowScan(b *testing.B) {
 	}
 }
 
+// ---- Freelist tests ----------------------------------------------------------
+
+// TestFreelist_DeleteReusesPages verifies that deleting a row with overflow
+// pages puts those pages back into the free list, and that the next overflow
+// insertion reuses them instead of growing the file.
+func TestFreelist_DeleteReusesPages(t *testing.T) {
+	tbl := openOverflowTable(t)
+
+	// Insert a row that needs 2 overflow pages.
+	text := bigText(2 * overflowChunkSize)
+	rid, err := tbl.Insert(Row{NewIntValue(1), NewTextValue(text)})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	pagesAfterInsert := tbl.heap.PageCount()
+	if pagesAfterInsert <= 2 {
+		t.Fatalf("expected overflow pages to be allocated, got PageCount=%d", pagesAfterInsert)
+	}
+
+	// Delete the row — overflow pages should be freed.
+	if _, err := tbl.Delete(rid); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if tbl.heap.PageCount() != pagesAfterInsert {
+		t.Errorf("PageCount changed after delete: want %d, got %d", pagesAfterInsert, tbl.heap.PageCount())
+	}
+
+	// Insert another row with the same overflow size — should reuse freed pages.
+	text2 := bigText(2 * overflowChunkSize)
+	rid2, err := tbl.Insert(Row{NewIntValue(2), NewTextValue(text2)})
+	if err != nil {
+		t.Fatalf("Insert after delete: %v", err)
+	}
+	pagesAfterReinsert := tbl.heap.PageCount()
+	if pagesAfterReinsert != pagesAfterInsert {
+		t.Errorf("file grew after reinsert: want PageCount=%d, got %d", pagesAfterInsert, pagesAfterReinsert)
+	}
+
+	// Read back the reinserted row to verify correctness.
+	row, ok, err := tbl.Get(rid2)
+	if err != nil {
+		t.Fatalf("Get after reinsert: %v", err)
+	}
+	if !ok {
+		t.Fatal("Get after reinsert: row not found")
+	}
+	if got := row[1].AsString(); got != text2 {
+		t.Errorf("text mismatch: got len %d, want len %d", len(got), len(text2))
+	}
+}
+
+// TestFreelist_UpdateReusesPages verifies that updating a row with overflow
+// pages frees the old overflow pages and that the replacement does not grow
+// the file when reusing them.
+func TestFreelist_UpdateReusesPages(t *testing.T) {
+	tbl := openOverflowTable(t)
+
+	// Insert a row with 2 overflow pages.
+	text := bigText(2 * overflowChunkSize)
+	rid, err := tbl.Insert(Row{NewIntValue(1), NewTextValue(text)})
+	if err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	pagesAfterInsert := tbl.heap.PageCount()
+
+	// Update with the same-size text — old pages freed, new pages reuse them.
+	newText := bigText(2 * overflowChunkSize)
+	newRID, ok, err := tbl.Update(rid, Row{NewIntValue(1), NewTextValue(newText)})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !ok {
+		t.Fatal("Update: row not found")
+	}
+	if tbl.heap.PageCount() != pagesAfterInsert {
+		t.Errorf("file grew after update: want PageCount=%d, got %d", pagesAfterInsert, tbl.heap.PageCount())
+	}
+
+	// Verify the updated content.
+	row, ok, err := tbl.Get(newRID)
+	if err != nil {
+		t.Fatalf("Get after update: %v", err)
+	}
+	if !ok {
+		t.Fatal("Get after update: row not found")
+	}
+	if got := row[1].AsString(); got != newText {
+		t.Errorf("text mismatch: got len %d, want len %d", len(got), len(newText))
+	}
+}
+
+// TestFreelist_Persistence verifies that the free list head survives a
+// Close/Open cycle so freed pages remain available across restarts.
+func TestFreelist_Persistence(t *testing.T) {
+	dir := t.TempDir()
+	schema, err := NewSchema([]Column{
+		{Name: "id", Type: TypeINT},
+		{Name: "body", Type: TypeTEXT},
+	})
+	if err != nil {
+		t.Fatalf("NewSchema: %v", err)
+	}
+
+	var pagesAfterInsert uint64
+	// Phase 1: insert and delete a row with overflow.
+	{
+		db, err := OpenDB(dir)
+		if err != nil {
+			t.Fatalf("OpenDB: %v", err)
+		}
+		tbl, err := db.CreateTable("t", schema)
+		if err != nil {
+			t.Fatalf("CreateTable: %v", err)
+		}
+		text := bigText(2 * overflowChunkSize)
+		rid, err := tbl.Insert(Row{NewIntValue(1), NewTextValue(text)})
+		if err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		pagesAfterInsert = tbl.heap.PageCount()
+		if _, err := tbl.Delete(rid); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+
+	// Phase 2: reopen and verify that new inserts reuse the freed pages.
+	{
+		db, err := OpenDB(dir)
+		if err != nil {
+			t.Fatalf("OpenDB reopen: %v", err)
+		}
+		defer db.Close()
+		tbl, err := db.OpenTable("t")
+		if err != nil {
+			t.Fatalf("OpenTable: %v", err)
+		}
+
+		// FreeListHead should have been persisted — new insert reuses pages.
+		text2 := bigText(2 * overflowChunkSize)
+		if _, err := tbl.Insert(Row{NewIntValue(2), NewTextValue(text2)}); err != nil {
+			t.Fatalf("Insert after reopen: %v", err)
+		}
+		if tbl.heap.PageCount() != pagesAfterInsert {
+			t.Errorf("file grew after reopen+reinsert: want PageCount=%d, got %d",
+				pagesAfterInsert, tbl.heap.PageCount())
+		}
+	}
+}
+
 // BenchmarkOverflowRead measures allocation reduction in overflow chain reading
 // for varying chain lengths, verifying that pre-allocation eliminates repeated
 // allocations.

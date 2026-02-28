@@ -50,7 +50,20 @@ OS file (pread/pwrite, no buffer pool)
 
 ### `lexer` / `parser` packages — SQL frontend, complete but not connected to storage
 
-Lexer produces typed tokens; parser builds a recursive-descent AST for `SELECT`, `INSERT`, and `CREATE TABLE`. No execution engine connects these to storage yet.
+Lexer produces typed tokens; parser builds a recursive-descent AST for `SELECT`, `INSERT`, `CREATE TABLE`, `UPDATE`, and `DELETE`.
+
+**Parser AST Structure** (`parser.go`):
+- `ColumnDef` struct now has structured fields:
+  - `Type string` - Base type name (e.g., "VARCHAR", "INT", "TEXT")
+  - `TypeLen *uint16` - Optional length for VARCHAR(N); nil if not specified
+  - `Nullable bool` - True if type ends with `?` marker (e.g., "TEXT?")
+- Parser automatically extracts VARCHAR length from `VARCHAR(N)` syntax
+- Validates VARCHAR length is in range 1-65535
+- Rejects length parameters on non-VARCHAR types (e.g., `INT(10)` is an error)
+
+**Integration points:**
+- `query/planner.go` - Converts parser AST to storage columns
+- `cmd/seeddb/main.go` - Executes CREATE TABLE and INSERT statements from SQL files
 
 ## Durability Model
 

@@ -172,7 +172,7 @@ func TestHeapFile_Insert_FillPage(t *testing.T) {
 func TestHeapFile_Delete(t *testing.T) {
 	h, schema := openHeap(t)
 	rid, _ := h.Insert(schema, testRow(1, "Alice", 1.0, ""))
-	if err := h.Delete(rid); err != nil {
+	if err := h.Delete(schema, rid); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	_, err := h.Fetch(schema, rid)
@@ -183,8 +183,8 @@ func TestHeapFile_Delete(t *testing.T) {
 }
 
 func TestHeapFile_Delete_InvalidRID(t *testing.T) {
-	h, _ := openHeap(t)
-	err := h.Delete(RID{PageID: 0, SlotID: 0})
+	h, schema := openHeap(t)
+	err := h.Delete(schema, RID{PageID: 0, SlotID: 0})
 	var e *ErrInvalidRID
 	if !errors.As(err, &e) {
 		t.Fatalf("expected ErrInvalidRID for meta page, got %T: %v", err, err)
@@ -194,8 +194,8 @@ func TestHeapFile_Delete_InvalidRID(t *testing.T) {
 func TestHeapFile_Delete_AlreadyDeleted(t *testing.T) {
 	h, schema := openHeap(t)
 	rid, _ := h.Insert(schema, testRow(1, "Bob", 2.0, ""))
-	h.Delete(rid)
-	err := h.Delete(rid)
+	h.Delete(schema, rid)
+	err := h.Delete(schema, rid)
 	var e *ErrDeletedSlot
 	if !errors.As(err, &e) {
 		t.Fatalf("expected ErrDeletedSlot on double-delete, got %T: %v", err, err)
@@ -259,7 +259,7 @@ func TestHeapFile_Scan_SkipDeleted(t *testing.T) {
 	}
 	// Delete odd-indexed rows.
 	for i := 1; i < n; i += 2 {
-		h.Delete(rids[i])
+		h.Delete(schema, rids[i])
 	}
 	count := 0
 	h.Scan(schema, func(rid RID, row Row) (bool, error) {

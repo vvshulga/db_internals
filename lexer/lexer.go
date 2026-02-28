@@ -25,8 +25,9 @@ type Token struct {
 }
 
 var keywords = map[string]bool{
-	"select": true,
-	"from":   true,
+	"select":   true,
+	"distinct": true,
+	"from":     true,
 	"where":  true,
 	"create": true,
 	"table":  true,
@@ -39,11 +40,17 @@ var keywords = map[string]bool{
 	"null":   true,
 	"set":    true,
 
-	"update": true,
-	"delete": true,
-	"drop":   true,
+	"update":   true,
+	"delete":   true,
+	"drop":     true,
+	"database": true,
+	"rename":   true,
+	"to":       true,
 	"group":  true,
 	"by":     true,
+	"order":  true,
+	"asc":    true,
+	"desc":   true,
 
 	// Aggregate functions
 	"count": true,

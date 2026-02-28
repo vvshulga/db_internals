@@ -13,6 +13,7 @@ Education project for the DB Internals CS osvita course. Implements an OLTP row-
 - [Table Manager API](#table-manager-api)
 - [storage\_cli](#storage_cli)
 - [dbserver / dbctl — Daemon Mode](#dbserver--dbctl--daemon-mode)
+- [Web Admin (ui_admin)](#web-admin-ui_admin)
 - [Demo](#demo)
 - [Running and Recovery](#running-and-recovery)
 - [SQL Frontend](#sql-frontend)
@@ -27,9 +28,9 @@ Education project for the DB Internals CS osvita course. Implements an OLTP row-
 ```bash
 git clone https://github.com/vvshulga/db_internals.git
 cd db_internals
-go test -v -race ./...        # run all tests
-go build -o db_internals .    # build the CLI
-./db_internals "SELECT * FROM users WHERE id = 1"
+go test -race ./...            # run all tests
+make build                     # build all CLI/daemon binaries
+./db_internals /tmp/mydb "SELECT * FROM users WHERE id = 1"
 ```
 
 ---
@@ -43,11 +44,12 @@ The storage engine is designed for **OLTP** (Online Transaction Processing):
 | Short transactions (single-row reads/writes) | Direct page I/O, no buffer pool |
 | Point lookups dominate | Stable `RID` (page+slot) for O(1) fetch |
 | Occasional full-table scans | Sequential `Scan()` walks pages in order |
-| Row sizes fit in one page | Max row ≈ 8 KiB; no overflow pages yet |
+| Row sizes usually fit in one page | Max inline row ≈ 8 KiB; large TEXT values spill to linked overflow pages |
 | Single-writer, no crash recovery | Coarse mutex per `HeapFile`; no WAL/redo log |
-| Tables grow via append | Freelist not yet implemented; deleted space reclaimed by compaction on insert |
+| Tables grow via append | Freed overflow pages are tracked in a singly-linked freelist and reused on the next write; inline tombstone space reclaimed by compaction on insert |
 
-The engine does **not** implement: buffer pool, B-tree indexes, WAL, multi-version concurrency control, or cross-table joins. These are future layers in the course.
+The engine does **not** implement: buffer pool, WAL, multi-version concurrency control, or cross-table joins.
+Implemented so far: B-tree column indexes, large-TEXT overflow pages with a freelist, and a SQL execution engine (`query.Engine`).
 
 ---
 
@@ -241,7 +243,8 @@ fileOffset = localPage × 8192
 Segment file (<table>.N.heap)
 ┌──────────────────────────────────┐  ← offset 0 (only in segment 0)
 │  Page 0 — MetaPage               │
-│  slot 0: TotalPages (uint64 LE)  │  8 bytes; 56 bytes reserved
+│  slot 0: TotalPages    uint64 LE   bytes  0–7   │
+│           FreeListHead  uint64 LE   bytes  8–15  │  46 bytes reserved
 ├──────────────────────────────────┤  ← offset 8192
 │  Page 1 — DataPage  (first data) │
 ├──────────────────────────────────┤  ← offset 16384
@@ -552,6 +555,63 @@ process exits.
 
 ---
 
+## Web Admin (ui_admin)
+
+`ui_admin` is a browser-based administration tool for the database. A Go HTTP server
+exposes a REST API backed directly by the `storage` package; the React 18 + TypeScript
+frontend is compiled to static files and served by the same binary.
+
+**Prerequisites**: Go 1.25+, Node.js 18+, npm
+
+### Build
+
+```bash
+cd ui_admin && make all && cd ..
+# Produces ./ui_admin_server in the project root
+```
+
+Or build everything at once from the project root:
+
+```bash
+make build-all
+```
+
+### Run
+
+```bash
+DB_DIR=/path/to/database ./ui_admin_server
+# Server starting on :8080, database: /path/to/database
+```
+
+Open http://localhost:8080. The `PORT` environment variable overrides the default port.
+
+### Development mode
+
+```bash
+cd ui_admin
+DB_DIR=./testdata make dev-backend   # Terminal 1: Go API on :8080
+make dev-frontend                    # Terminal 2: Vite hot-reload on :5173
+```
+
+Navigate to http://localhost:5173. The Vite dev server proxies `/api/*` to the backend.
+
+### API endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/info` | Database metadata (directory, table count) |
+| `GET` | `/api/tables` | List all tables |
+| `POST` | `/api/tables` | Create table |
+| `GET` | `/api/tables/:name` | Table schema |
+| `DELETE` | `/api/tables/:name` | Drop table |
+| `GET` | `/api/tables/:name/rows[?page=N&page_size=M]` | Scan rows (paginated) |
+| `POST` | `/api/tables/:name/rows` | Insert row |
+| `GET` | `/api/tables/:name/rows/:rid` | Get row by RID |
+| `PUT` | `/api/tables/:name/rows/:rid` | Update row |
+| `DELETE` | `/api/tables/:name/rows/:rid` | Delete row |
+
+---
+
 ## Demo
 
 `demo.sh` is an end-to-end script that walks through the full employee lifecycle using every `storage_cli` command. It serves as both a quick sanity check and a self-documenting example.
@@ -579,6 +639,61 @@ The script creates a temporary database directory (cleaned up on exit) and runs 
 14. `list-tables` — confirms the catalog is empty
 
 Expected final line: `✓  demo complete`
+
+### Daemon + Web Admin demo
+
+An interactive end-to-end walkthrough using the daemon and the web admin UI.
+
+**Step 1 — Build all binaries:**
+
+```bash
+make build                            # Go binaries (dbserver, dbctl, seeddb, …)
+cd ui_admin && make all && cd ..      # ui_admin_server + React frontend
+```
+
+**Step 2 — Start the database daemon:**
+
+```bash
+./dbctl --dir /tmp/demo start
+# → dbserver started (pid XXXX, log: /tmp/demo/dbserver.log)
+```
+
+**Step 3 — Seed the database with sample data:**
+
+`seeddb` reads a SQL file and runs `CREATE TABLE` / `INSERT` statements directly
+against the storage layer. The bundled `ui_admin/seed.sql` creates five e-commerce
+tables (users, categories, products, orders, order_items) with ~75 rows.
+
+```bash
+./seeddb -db /tmp/demo -sql ui_admin/seed.sql
+```
+
+**Step 4 — Verify via CLI:**
+
+```bash
+./dbctl --dir /tmp/demo list-tables
+./dbctl --dir /tmp/demo scan users
+```
+
+**Step 5 — Start the web admin:**
+
+`ui_admin_server` opens the database directory directly, so stop the daemon first
+(both hold the heap files open; they cannot share a directory simultaneously).
+
+```bash
+./dbctl --dir /tmp/demo stop
+DB_DIR=/tmp/demo ./ui_admin_server
+# → Server starting on :8080, database: /tmp/demo
+```
+
+**Step 6 — Open the browser:**
+
+Navigate to http://localhost:8080. The UI lets you browse tables, view and edit rows
+(with pagination), and create or drop tables.
+
+**Step 7 — Shut down:**
+
+Press `Ctrl-C` to stop `ui_admin_server`.
 
 ---
 
@@ -675,18 +790,25 @@ that is already validated on every `Unmarshal`, so corrupt pages are detected at
 
 ## SQL Frontend
 
-The `lexer` and `parser` packages tokenize SQL and build an AST. They are not yet connected to the storage engine.
+The `lexer` and `parser` packages tokenize SQL and build an AST.
+The `query` package (`planner` → `optimizer` → `physical operators`) translates that
+AST into storage operations. `query.Engine` ties it all together: one `Execute(sql)` call.
 
-**Supported statements**: `SELECT`, `INSERT INTO`, `CREATE TABLE`
+**Supported statements**: `SELECT`, `INSERT INTO`, `CREATE TABLE`, `UPDATE`, `DELETE`
 
 ```bash
-./db_internals "SELECT id, name FROM users WHERE age > 18 LIMIT 10"
-./db_internals "INSERT INTO products VALUES (1, 'Laptop', 999)"
-./db_internals "CREATE TABLE employees (id INT, name TEXT, salary INT)"
+# Usage: db_internals <database-dir> <sql>
+./db_internals /tmp/mydb "CREATE TABLE users (id INT, name VARCHAR(64))"
+./db_internals /tmp/mydb "INSERT INTO users VALUES (1, 'Alice')"
+./db_internals /tmp/mydb "SELECT * FROM users WHERE id = 1"
+./db_internals /tmp/mydb "UPDATE users SET name = 'Bob' WHERE id = 1"
+./db_internals /tmp/mydb "DELETE FROM users WHERE id = 1"
+./db_internals /tmp/mydb "SELECT name, COUNT(*) FROM orders GROUP BY name"
 ```
 
 **WHERE operators**: `=  !=  <  >  <=  >=`
 **Logical operators**: `AND  OR`
+**Aggregate functions** (with `GROUP BY`): `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
 
 ---
 

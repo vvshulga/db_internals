@@ -154,6 +154,26 @@ func (e *ErrCorruptCatalog) Error() string {
 	return fmt.Sprintf("storage: corrupt catalog: %s", e.Reason)
 }
 
+// ErrDatabaseExists is returned by CreateDatabase when the target directory
+// already exists.
+type ErrDatabaseExists struct {
+	Name string
+}
+
+func (e *ErrDatabaseExists) Error() string {
+	return fmt.Sprintf("storage: database %q already exists", e.Name)
+}
+
+// ErrDatabaseNotFound is returned by DropDatabase and RenameDatabase when the
+// target directory does not exist.
+type ErrDatabaseNotFound struct {
+	Name string
+}
+
+func (e *ErrDatabaseNotFound) Error() string {
+	return fmt.Sprintf("storage: database %q not found", e.Name)
+}
+
 // ErrIndexExists is returned by CreateIndex when an index for the column
 // already exists on the table.
 type ErrIndexExists struct {

@@ -19,7 +19,8 @@ const metaTupleSize = 64
 
 // heapMeta is the in-memory cache of the metadata stored on the meta page.
 type heapMeta struct {
-	TotalPages uint64 // global page count including page 0; always >= 2
+	TotalPages   uint64 // bytes 0-7: global page count including page 0; always >= 2
+	FreeListHead uint64 // bytes 8-15: first free overflow page (0 = empty list)
 }
 
 // HeapFile manages a table's data as a sequence of segment files.
@@ -183,9 +184,10 @@ func (h *HeapFile) Fetch(schema *Schema, rid RID) (Row, error) {
 	return decodeWithOverflow(schema, data, h)
 }
 
-// Delete marks the row identified by rid as deleted (tombstone).
-// Space is not reclaimed until the page is compacted on a future insert.
-func (h *HeapFile) Delete(rid RID) error {
+// Delete marks the row identified by rid as deleted (tombstone) and frees any
+// overflow pages belonging to the row. Space on the data page is not reclaimed
+// until the page is compacted on a future insert.
+func (h *HeapFile) Delete(schema *Schema, rid RID) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -194,6 +196,13 @@ func (h *HeapFile) Delete(rid RID) error {
 	}
 	pg, err := h.readPage(rid.PageID)
 	if err != nil {
+		return err
+	}
+	data, err := pg.GetTuple(rid.SlotID)
+	if err != nil {
+		return err
+	}
+	if err := freeRowOverflow(schema, data, h); err != nil {
 		return err
 	}
 	if err := pg.DeleteTuple(rid.SlotID); err != nil {
@@ -205,28 +214,36 @@ func (h *HeapFile) Delete(rid RID) error {
 // Update performs a delete-then-reinsert. It is not atomic: a crash between
 // the two operations leaves the old row deleted without the new row present.
 // Returns the new RID of the updated row.
-//
-// Note: overflow pages from the old row are not reclaimed (space leak);
-// a freelist is needed for reclamation and is out of scope for this release.
 func (h *HeapFile) Update(schema *Schema, rid RID, newRow Row) (RID, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	// Encode new row (may write overflow pages) before touching the old row.
-	newData, err := encodeWithOverflow(schema, newRow, h)
-	if err != nil {
-		return RID{}, err
-	}
 
 	if err := h.validateRID(rid); err != nil {
 		return RID{}, err
 	}
 
-	// Delete old row (overflow pages of the old row are leaked; see note above).
+	// Read the old row first so its overflow pages can be freed before the
+	// new row is encoded. This lets writeOverflowChain reuse the just-freed
+	// pages, keeping the heap file from growing unnecessarily.
 	pg, err := h.readPage(rid.PageID)
 	if err != nil {
 		return RID{}, err
 	}
+	oldData, err := pg.GetTuple(rid.SlotID)
+	if err != nil {
+		return RID{}, err
+	}
+	if err := freeRowOverflow(schema, oldData, h); err != nil {
+		return RID{}, err
+	}
+
+	// Encode new row (may reuse overflow pages freed above).
+	newData, err := encodeWithOverflow(schema, newRow, h)
+	if err != nil {
+		return RID{}, err
+	}
+
+	// Tombstone the old slot.
 	if err := pg.DeleteTuple(rid.SlotID); err != nil {
 		return RID{}, err
 	}
@@ -379,6 +396,9 @@ func (h *HeapFile) readMeta() error {
 			return fmt.Errorf("readMeta: meta tuple too short (%d bytes)", len(data))
 		}
 		h.meta.TotalPages = binary.LittleEndian.Uint64(data[0:])
+		if len(data) >= 16 {
+			h.meta.FreeListHead = binary.LittleEndian.Uint64(data[8:])
+		}
 		return nil
 	}
 	return fmt.Errorf("readMeta: no live meta tuple found on page 0")
@@ -392,6 +412,7 @@ func (h *HeapFile) writeMeta() error {
 	pg := NewPage(0, MetaPage)
 	var buf [metaTupleSize]byte
 	binary.LittleEndian.PutUint64(buf[0:], h.meta.TotalPages)
+	binary.LittleEndian.PutUint64(buf[8:], h.meta.FreeListHead)
 	if _, err := pg.InsertTuple(buf[:]); err != nil {
 		return fmt.Errorf("writeMeta: insert meta: %w", err)
 	}

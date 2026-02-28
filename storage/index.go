@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -26,10 +28,12 @@ type IndexEntry struct {
 	RID   RID
 }
 
-// compareValues returns -1, 0, or 1 for a < b, a == b, a > b.
 // NULL sorts before all non-NULL values. Different kinds sort by their
 // ValueKind ordinal. Same kind uses type-natural comparison.
-func compareValues(a, b Value) int {
+// CompareValues compares two Values for ordering.
+// Returns -1 (a < b), 0 (a == b), or 1 (a > b).
+// Used by both indexes and query execution.
+func CompareValues(a, b Value) int {
 	aN, bN := a.IsNull(), b.IsNull()
 	if aN && bN {
 		return 0
@@ -73,7 +77,7 @@ func compareValues(a, b Value) int {
 // compareIndexEntry is the less-function for the generic btree.
 // Returns true if a sorts strictly before b.
 func compareIndexEntry(a, b IndexEntry) bool {
-	c := compareValues(a.Value, b.Value)
+	c := CompareValues(a.Value, b.Value)
 	if c != 0 {
 		return c < 0
 	}
@@ -165,7 +169,7 @@ func (idx *Index) Insert(val Value, rid RID) error {
 		pivot := IndexEntry{Value: val, RID: RID{PageID: 0, SlotID: 0}}
 		var violation bool
 		idx.tree.AscendGreaterOrEqual(pivot, func(e IndexEntry) bool {
-			if compareValues(e.Value, val) != 0 {
+			if CompareValues(e.Value, val) != 0 {
 				return false
 			}
 			if e.RID != rid {
@@ -200,7 +204,7 @@ func (idx *Index) Lookup(val Value) []RID {
 	pivot := IndexEntry{Value: val, RID: RID{PageID: 0, SlotID: 0}}
 	var rids []RID
 	idx.tree.AscendGreaterOrEqual(pivot, func(e IndexEntry) bool {
-		if compareValues(e.Value, val) != 0 {
+		if CompareValues(e.Value, val) != 0 {
 			return false
 		}
 		rids = append(rids, e.RID)
@@ -217,7 +221,7 @@ func (idx *Index) RangeScan(lo, hi *Value, fn func(IndexEntry) bool) {
 	defer idx.mu.RUnlock()
 
 	iter := func(e IndexEntry) bool {
-		if hi != nil && compareValues(e.Value, *hi) > 0 {
+		if hi != nil && CompareValues(e.Value, *hi) > 0 {
 			return false
 		}
 		return fn(e)
@@ -241,7 +245,8 @@ func (idx *Index) Len() int {
 // ---- Persistence helpers -------------------------------------------------------
 
 // save serializes the tree to disk atomically via a tmp file.
-// File format: [version:1] [unique:1] [reserved:6] [count:8] [entries...]
+// File format v2: [version:1] [unique:1] [checksum:4] [reserved:2] [count:8] [entries...]
+// The checksum (CRC32-IEEE) covers all entry data.
 // Caller must hold idx.mu (write lock).
 func (idx *Index) save() error {
 	tmpPath := idx.indexPath() + ".tmp"
@@ -251,25 +256,12 @@ func (idx *Index) save() error {
 	}
 
 	n := idx.tree.Len()
-	var hdr [16]byte
-	hdr[0] = 1 // version
-	if idx.unique {
-		hdr[1] = 1
-	} else {
-		hdr[1] = 0
-	}
-	// hdr[2:8] reserved for future use
-	binary.LittleEndian.PutUint64(hdr[8:], uint64(n)) // entry count
 
-	if _, err := f.Write(hdr[:]); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("write header: %w", err)
-	}
-
+	// Write entries to buffer FIRST to compute checksum
+	var entriesBuf bytes.Buffer
 	var writeErr error
 	idx.tree.Ascend(func(e IndexEntry) bool {
-		if err := writeEntry(f, e); err != nil {
+		if err := writeEntry(&entriesBuf, e); err != nil {
 			writeErr = err
 			return false
 		}
@@ -280,6 +272,34 @@ func (idx *Index) save() error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write entry: %w", writeErr)
 	}
+
+	// Compute checksum of entries
+	checksum := crc32.ChecksumIEEE(entriesBuf.Bytes())
+
+	// Build header
+	var hdr [16]byte
+	hdr[0] = 2 // version 2
+	if idx.unique {
+		hdr[1] = 1
+	} else {
+		hdr[1] = 0
+	}
+	binary.LittleEndian.PutUint32(hdr[2:], checksum) // NEW: checksum bytes
+	// hdr[6:8] reserved for future use
+	binary.LittleEndian.PutUint64(hdr[8:], uint64(n)) // entry count
+
+	// Write header + entries
+	if _, err := f.Write(hdr[:]); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write header: %w", err)
+	}
+	if _, err := f.Write(entriesBuf.Bytes()); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write entries: %w", err)
+	}
+
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpPath)
@@ -298,6 +318,7 @@ func (idx *Index) save() error {
 }
 
 // load reads all entries from the index file into the tree.
+// Supports both v1 (no checksum) and v2 (with checksum) formats.
 // Caller must hold idx.mu or be in single-threaded init.
 func (idx *Index) load() error {
 	f, err := os.Open(idx.indexPath())
@@ -312,11 +333,49 @@ func (idx *Index) load() error {
 	}
 
 	version := hdr[0]
-	if version != 1 {
+
+	// Backward compatibility: support v1 (no checksum)
+	if version == 1 {
+		return idx.loadV1(f, hdr)
+	}
+
+	if version != 2 {
 		return fmt.Errorf("unsupported index format version %d", version)
 	}
 
-	idx.unique = (hdr[1] == 1) // Load unique flag from file
+	// Version 2: verify checksum
+	idx.unique = (hdr[1] == 1)
+	storedChecksum := binary.LittleEndian.Uint32(hdr[2:])
+	n := binary.LittleEndian.Uint64(hdr[8:])
+
+	// Read all entries into buffer
+	var entriesBuf bytes.Buffer
+	if _, err := io.Copy(&entriesBuf, f); err != nil {
+		return fmt.Errorf("read entries: %w", err)
+	}
+
+	// Verify checksum
+	computedChecksum := crc32.ChecksumIEEE(entriesBuf.Bytes())
+	if storedChecksum != computedChecksum {
+		return fmt.Errorf("index checksum mismatch: stored=0x%08x computed=0x%08x (file may be corrupted)",
+			storedChecksum, computedChecksum)
+	}
+
+	// Parse entries
+	reader := bytes.NewReader(entriesBuf.Bytes())
+	for i := uint64(0); i < n; i++ {
+		e, err := readEntry(reader)
+		if err != nil {
+			return fmt.Errorf("read entry %d: %w", i, err)
+		}
+		idx.tree.ReplaceOrInsert(e)
+	}
+	return nil
+}
+
+// loadV1 handles backward compatibility with version 1 index files (no checksum).
+func (idx *Index) loadV1(f *os.File, hdr [16]byte) error {
+	idx.unique = (hdr[1] == 1)
 	n := binary.LittleEndian.Uint64(hdr[8:])
 
 	for i := uint64(0); i < n; i++ {

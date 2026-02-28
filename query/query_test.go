@@ -578,7 +578,7 @@ func TestQuery_DeleteWithLimit(t *testing.T) {
 
 	count := 0
 	for {
-		_, err := physical.Next()
+		_, err = physical.Next()
 		if err == io.EOF {
 			break
 		}
@@ -874,5 +874,652 @@ func TestQuery_AggregateWithNulls(t *testing.T) {
 	}
 	if !row[3].IsNull() {
 		t.Error("expected MAX to return NULL when all values are NULL")
+	}
+}
+
+func TestQuery_OrderBySingleColumnASC(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "id", Type: storage.TypeINT},
+		{Name: "name", Type: storage.TypeVARCHAR, MaxLen: 64},
+	})
+	table, _ := db.CreateTable("users", schema)
+
+	// Insert in random order
+	table.Insert(storage.Row{storage.NewIntValue(3), storage.NewVarcharValue("Charlie")})
+	table.Insert(storage.Row{storage.NewIntValue(1), storage.NewVarcharValue("Alice")})
+	table.Insert(storage.Row{storage.NewIntValue(2), storage.NewVarcharValue("Bob")})
+
+	// Query: SELECT id, name FROM users ORDER BY id ASC
+	sql := "SELECT id, name FROM users ORDER BY id ASC"
+	nodes, err := parser.ParseString(sql)
+	if err != nil {
+		t.Fatalf("ParseString failed: %v", err)
+	}
+	logical, err := NewPlanner(db).Plan(nodes[0])
+	if err != nil {
+		t.Fatalf("Plan failed: %v", err)
+	}
+	physical, err := NewOptimizer(db).Optimize(logical)
+	if err != nil {
+		t.Fatalf("Optimize failed: %v", err)
+	}
+
+	if err = physical.Open(); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer physical.Close()
+
+	// Verify order: Alice (id=1), Bob (id=2), Charlie (id=3)
+	expected := []struct{ id int32; name string }{
+		{1, "Alice"},
+		{2, "Bob"},
+		{3, "Charlie"},
+	}
+	for i, exp := range expected {
+		row, err := physical.Next()
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if row[0].AsInt() != exp.id || row[1].AsString() != exp.name {
+			t.Errorf("row %d: expected (id=%d, name=%s), got (id=%d, name=%s)",
+				i, exp.id, exp.name, row[0].AsInt(), row[1].AsString())
+		}
+	}
+
+	_, err = physical.Next()
+	if err != io.EOF {
+		t.Errorf("expected EOF, got %v", err)
+	}
+}
+
+func TestQuery_OrderBySingleColumnDESC(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "id", Type: storage.TypeINT},
+		{Name: "name", Type: storage.TypeVARCHAR, MaxLen: 64},
+	})
+	table, _ := db.CreateTable("users", schema)
+
+	table.Insert(storage.Row{storage.NewIntValue(1), storage.NewVarcharValue("Alice")})
+	table.Insert(storage.Row{storage.NewIntValue(3), storage.NewVarcharValue("Charlie")})
+	table.Insert(storage.Row{storage.NewIntValue(2), storage.NewVarcharValue("Bob")})
+
+	// Query: SELECT id, name FROM users ORDER BY id DESC
+	sql := "SELECT id, name FROM users ORDER BY id DESC"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Verify order: Charlie (id=3), Bob (id=2), Alice (id=1)
+	expected := []struct{ id int32; name string }{
+		{3, "Charlie"},
+		{2, "Bob"},
+		{1, "Alice"},
+	}
+	for i, exp := range expected {
+		row, err := physical.Next()
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if row[0].AsInt() != exp.id || row[1].AsString() != exp.name {
+			t.Errorf("row %d: expected (id=%d, name=%s), got (id=%d, name=%s)",
+				i, exp.id, exp.name, row[0].AsInt(), row[1].AsString())
+		}
+	}
+
+	_, err := physical.Next()
+	if err != io.EOF {
+		t.Errorf("expected EOF, got %v", err)
+	}
+}
+
+func TestQuery_OrderByMultipleColumns(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "dept", Type: storage.TypeVARCHAR, MaxLen: 32},
+		{Name: "salary", Type: storage.TypeINT},
+		{Name: "name", Type: storage.TypeVARCHAR, MaxLen: 64},
+	})
+	table, _ := db.CreateTable("employees", schema)
+
+	// Insert test data (mixed departments and salaries)
+	table.Insert(storage.Row{storage.NewVarcharValue("Sales"), storage.NewIntValue(50000), storage.NewVarcharValue("Alice")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Engineering"), storage.NewIntValue(80000), storage.NewVarcharValue("Bob")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Sales"), storage.NewIntValue(60000), storage.NewVarcharValue("Charlie")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Engineering"), storage.NewIntValue(90000), storage.NewVarcharValue("Diana")})
+
+	// ORDER BY dept ASC, salary DESC
+	sql := "SELECT dept, salary, name FROM employees ORDER BY dept ASC, salary DESC"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Expected order:
+	// 1. Engineering, 90000, Diana (dept ASC, salary DESC within Engineering)
+	// 2. Engineering, 80000, Bob
+	// 3. Sales, 60000, Charlie (dept ASC, salary DESC within Sales)
+	// 4. Sales, 50000, Alice
+
+	expected := []struct {
+		dept   string
+		salary int32
+		name   string
+	}{
+		{"Engineering", 90000, "Diana"},
+		{"Engineering", 80000, "Bob"},
+		{"Sales", 60000, "Charlie"},
+		{"Sales", 50000, "Alice"},
+	}
+
+	for i, exp := range expected {
+		row, err := physical.Next()
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if row[0].AsString() != exp.dept || row[1].AsInt() != exp.salary || row[2].AsString() != exp.name {
+			t.Errorf("row %d: expected (%s, %d, %s), got (%s, %d, %s)",
+				i, exp.dept, exp.salary, exp.name,
+				row[0].AsString(), row[1].AsInt(), row[2].AsString())
+		}
+	}
+}
+
+func TestQuery_OrderByWithNulls(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "id", Type: storage.TypeINT},
+		{Name: "score", Type: storage.TypeINT, Nullable: true},
+	})
+	table, _ := db.CreateTable("scores", schema)
+
+	// Insert data with NULLs
+	table.Insert(storage.Row{storage.NewIntValue(1), storage.NewIntValue(100)})
+	table.Insert(storage.Row{storage.NewIntValue(2), storage.NewNullValue()})
+	table.Insert(storage.Row{storage.NewIntValue(3), storage.NewIntValue(50)})
+	table.Insert(storage.Row{storage.NewIntValue(4), storage.NewNullValue()})
+
+	// ORDER BY score ASC (NULLs should come first)
+	sql := "SELECT id, score FROM scores ORDER BY score ASC"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Expected: NULL, NULL, 50, 100
+	row1, _ := physical.Next()
+	if !row1[1].IsNull() {
+		t.Errorf("expected NULL first, got %v", row1[1])
+	}
+
+	row2, _ := physical.Next()
+	if !row2[1].IsNull() {
+		t.Errorf("expected NULL second, got %v", row2[1])
+	}
+
+	row3, _ := physical.Next()
+	if row3[1].AsInt() != 50 {
+		t.Errorf("expected 50, got %d", row3[1].AsInt())
+	}
+
+	row4, _ := physical.Next()
+	if row4[1].AsInt() != 100 {
+		t.Errorf("expected 100, got %d", row4[1].AsInt())
+	}
+}
+
+func TestQuery_OrderByWithLimit(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "value", Type: storage.TypeINT},
+	})
+	table, _ := db.CreateTable("numbers", schema)
+
+	// Insert 10 numbers
+	for i := 10; i >= 1; i-- {
+		table.Insert(storage.Row{storage.NewIntValue(int32(i))})
+	}
+
+	// ORDER BY + LIMIT should return top 3
+	sql := "SELECT value FROM numbers ORDER BY value DESC LIMIT 3"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	expected := []int32{10, 9, 8}
+	for i, exp := range expected {
+		row, err := physical.Next()
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if row[0].AsInt() != exp {
+			t.Errorf("row %d: expected %d, got %d", i, exp, row[0].AsInt())
+		}
+	}
+
+	_, err := physical.Next()
+	if err != io.EOF {
+		t.Errorf("expected EOF after 3 rows, got %v", err)
+	}
+}
+
+func TestQuery_OrderByEmptyTable(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "id", Type: storage.TypeINT},
+	})
+	_, _ = db.CreateTable("empty", schema)
+
+	sql := "SELECT * FROM empty ORDER BY id"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	_, err := physical.Next()
+	if err != io.EOF {
+		t.Errorf("expected EOF on empty table, got %v", err)
+	}
+}
+
+func TestQuery_OrderByWithWhere(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "id", Type: storage.TypeINT},
+		{Name: "age", Type: storage.TypeINT},
+	})
+	table, _ := db.CreateTable("users", schema)
+
+	table.Insert(storage.Row{storage.NewIntValue(1), storage.NewIntValue(25)})
+	table.Insert(storage.Row{storage.NewIntValue(2), storage.NewIntValue(15)})
+	table.Insert(storage.Row{storage.NewIntValue(3), storage.NewIntValue(35)})
+	table.Insert(storage.Row{storage.NewIntValue(4), storage.NewIntValue(20)})
+
+	// WHERE age > 18 ORDER BY age ASC
+	sql := "SELECT id, age FROM users WHERE age > 18 ORDER BY age ASC"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Expected: id=4 (age=20), id=1 (age=25), id=3 (age=35)
+	expected := []struct{ id, age int32 }{
+		{4, 20},
+		{1, 25},
+		{3, 35},
+	}
+
+	for i, exp := range expected {
+		row, err := physical.Next()
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if row[0].AsInt() != exp.id || row[1].AsInt() != exp.age {
+			t.Errorf("row %d: expected (id=%d, age=%d), got (id=%d, age=%d)",
+				i, exp.id, exp.age, row[0].AsInt(), row[1].AsInt())
+		}
+	}
+}
+
+func TestQuery_DistinctSingleColumn(t *testing.T) {
+	db := setupTestDB(t)
+
+	// Create and populate table with duplicates
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "dept", Type: storage.TypeVARCHAR, MaxLen: 32},
+	})
+	table, _ := db.CreateTable("employees", schema)
+	table.Insert(storage.Row{storage.NewVarcharValue("Engineering")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Sales")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Engineering")}) // duplicate
+	table.Insert(storage.Row{storage.NewVarcharValue("Sales")})       // duplicate
+	table.Insert(storage.Row{storage.NewVarcharValue("HR")})
+
+	// SELECT DISTINCT dept FROM employees
+	sql := "SELECT DISTINCT dept FROM employees"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Collect results
+	results := make(map[string]bool)
+	for {
+		row, err := physical.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		results[row[0].AsString()] = true
+	}
+
+	// Should have exactly 3 unique departments
+	if len(results) != 3 {
+		t.Errorf("expected 3 unique departments, got %d", len(results))
+	}
+
+	// Verify we got the right departments
+	expected := map[string]bool{
+		"Engineering": true,
+		"Sales":       true,
+		"HR":          true,
+	}
+	for dept := range expected {
+		if !results[dept] {
+			t.Errorf("missing department: %s", dept)
+		}
+	}
+}
+
+func TestQuery_DistinctMultipleColumns(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "dept", Type: storage.TypeVARCHAR, MaxLen: 32},
+		{Name: "level", Type: storage.TypeINT},
+	})
+	table, _ := db.CreateTable("employees", schema)
+
+	// Insert rows with some duplicates
+	table.Insert(storage.Row{storage.NewVarcharValue("Eng"), storage.NewIntValue(1)})
+	table.Insert(storage.Row{storage.NewVarcharValue("Eng"), storage.NewIntValue(2)})
+	table.Insert(storage.Row{storage.NewVarcharValue("Eng"), storage.NewIntValue(1)}) // duplicate
+	table.Insert(storage.Row{storage.NewVarcharValue("Sales"), storage.NewIntValue(1)})
+
+	sql := "SELECT DISTINCT dept, level FROM employees"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Count unique rows
+	count := 0
+	for {
+		_, err := physical.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		count++
+	}
+
+	// Should have exactly 3 unique (dept, level) pairs
+	if count != 3 {
+		t.Errorf("expected 3 unique rows, got %d", count)
+	}
+}
+
+func TestQuery_DistinctWithNulls(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "name", Type: storage.TypeVARCHAR, MaxLen: 32, Nullable: true},
+	})
+	table, _ := db.CreateTable("users", schema)
+
+	// Insert rows with NULL values
+	table.Insert(storage.Row{storage.NewVarcharValue("Alice")})
+	table.Insert(storage.Row{storage.NewNullValue()})           // NULL
+	table.Insert(storage.Row{storage.NewNullValue()})           // NULL (duplicate)
+	table.Insert(storage.Row{storage.NewVarcharValue("Bob")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Alice")}) // duplicate
+
+	sql := "SELECT DISTINCT name FROM users"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	count := 0
+	nullCount := 0
+	for {
+		row, err := physical.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		count++
+		if row[0].IsNull() {
+			nullCount++
+		}
+	}
+
+	// Should have 3 unique values: Alice, Bob, NULL
+	if count != 3 {
+		t.Errorf("expected 3 unique values (including NULL), got %d", count)
+	}
+
+	// Should have exactly 1 NULL (two NULLs should be deduplicated)
+	if nullCount != 1 {
+		t.Errorf("expected 1 NULL value, got %d", nullCount)
+	}
+}
+
+func TestQuery_DistinctWithWhere(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "dept", Type: storage.TypeVARCHAR, MaxLen: 32},
+		{Name: "active", Type: storage.TypeINT},
+	})
+	table, _ := db.CreateTable("employees", schema)
+
+	table.Insert(storage.Row{storage.NewVarcharValue("Eng"), storage.NewIntValue(1)})
+	table.Insert(storage.Row{storage.NewVarcharValue("Eng"), storage.NewIntValue(1)})    // duplicate
+	table.Insert(storage.Row{storage.NewVarcharValue("Sales"), storage.NewIntValue(1)})
+	table.Insert(storage.Row{storage.NewVarcharValue("HR"), storage.NewIntValue(0)})
+
+	sql := "SELECT DISTINCT dept FROM employees WHERE active = 1"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	count := 0
+	for {
+		_, err := physical.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		count++
+	}
+
+	// Should have 2 unique active departments: Eng, Sales (HR is filtered out)
+	if count != 2 {
+		t.Errorf("expected 2 unique active departments, got %d", count)
+	}
+}
+
+func TestQuery_DistinctWithOrderBy(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "name", Type: storage.TypeVARCHAR, MaxLen: 32},
+	})
+	table, _ := db.CreateTable("users", schema)
+
+	table.Insert(storage.Row{storage.NewVarcharValue("Charlie")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Alice")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Bob")})
+	table.Insert(storage.Row{storage.NewVarcharValue("Alice")}) // duplicate
+
+	sql := "SELECT DISTINCT name FROM users ORDER BY name ASC"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Results should be distinct AND sorted
+	expected := []string{"Alice", "Bob", "Charlie"}
+	for i, expectedName := range expected {
+		row, err := physical.Next()
+		if err != nil {
+			t.Fatalf("expected row %d, got error: %v", i, err)
+		}
+		if row[0].AsString() != expectedName {
+			t.Errorf("row %d: expected %s, got %s", i, expectedName, row[0].AsString())
+		}
+	}
+
+	// No more rows
+	_, err := physical.Next()
+	if err != io.EOF {
+		t.Errorf("expected EOF after 3 rows, got: %v", err)
+	}
+}
+
+func TestQuery_DistinctWithLimit(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "value", Type: storage.TypeINT},
+	})
+	table, _ := db.CreateTable("numbers", schema)
+
+	// Insert many duplicates
+	for i := 1; i <= 5; i++ {
+		table.Insert(storage.Row{storage.NewIntValue(int32(i))})
+		table.Insert(storage.Row{storage.NewIntValue(int32(i))}) // duplicate each
+	}
+
+	sql := "SELECT DISTINCT value FROM numbers LIMIT 3"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	count := 0
+	for {
+		_, err := physical.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		count++
+	}
+
+	// Should return only 3 unique values (LIMIT 3)
+	if count != 3 {
+		t.Errorf("expected 3 rows (LIMIT 3), got %d", count)
+	}
+}
+
+func TestQuery_DistinctEmptyTable(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "id", Type: storage.TypeINT},
+	})
+	_, _ = db.CreateTable("empty", schema)
+
+	sql := "SELECT DISTINCT id FROM empty"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	// Should return no rows
+	_, err := physical.Next()
+	if err != io.EOF {
+		t.Errorf("expected EOF on empty table, got: %v", err)
+	}
+}
+
+func TestQuery_DistinctAllDataTypes(t *testing.T) {
+	db := setupTestDB(t)
+
+	schema, _ := storage.NewSchema([]storage.Column{
+		{Name: "i", Type: storage.TypeINT},
+		{Name: "b", Type: storage.TypeBIGINT},
+		{Name: "f", Type: storage.TypeFLOAT},
+		{Name: "d", Type: storage.TypeDOUBLE},
+		{Name: "bool", Type: storage.TypeBOOLEAN},
+		{Name: "str", Type: storage.TypeVARCHAR, MaxLen: 32},
+	})
+	table, _ := db.CreateTable("types", schema)
+
+	// Insert duplicate rows with various types
+	row1 := storage.Row{
+		storage.NewIntValue(42),
+		storage.NewBigIntValue(1000),
+		storage.NewFloatValue(3.14),
+		storage.NewDoubleValue(2.718),
+		storage.NewBooleanValue(true),
+		storage.NewVarcharValue("test"),
+	}
+
+	table.Insert(row1)
+	table.Insert(row1) // exact duplicate
+
+	sql := "SELECT DISTINCT * FROM types"
+	nodes, _ := parser.ParseString(sql)
+	logical, _ := NewPlanner(db).Plan(nodes[0])
+	physical, _ := NewOptimizer(db).Optimize(logical)
+
+	physical.Open()
+	defer physical.Close()
+
+	count := 0
+	for {
+		_, err := physical.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		count++
+	}
+
+	// Should deduplicate to 1 unique row
+	if count != 1 {
+		t.Errorf("expected 1 unique row, got %d", count)
 	}
 }

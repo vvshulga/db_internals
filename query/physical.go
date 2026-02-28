@@ -3,6 +3,8 @@ package query
 import (
 	"fmt"
 	"io"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/vvshulga/db_internals/parser"
@@ -850,6 +852,198 @@ func (op *PhysicalAggregate) finalizeAggregate(state *AggregateState, aggIdx int
 	}
 }
 
+// ---- PhysicalSort ---------------------------------------------------------
+
+// PhysicalSort sorts input rows by multiple columns.
+// This is a materializing operator (buffers all rows before sorting).
+type PhysicalSort struct {
+	input     PhysicalOperator
+	sortKeys  []SortKeyPhysical
+	schema    *storage.Schema
+
+	buffer    []storage.Row
+	resultIdx int
+}
+
+// SortKeyPhysical represents a sort column with resolved index.
+type SortKeyPhysical struct {
+	ColIndex  int
+	Direction string
+}
+
+func NewPhysicalSort(input PhysicalOperator, sortKeys []SortKeyPhysical) *PhysicalSort {
+	return &PhysicalSort{
+		input:    input,
+		sortKeys: sortKeys,
+		schema:   input.Schema(),
+		buffer:   make([]storage.Row, 0),
+	}
+}
+
+func (op *PhysicalSort) Open() error {
+	if err := op.input.Open(); err != nil {
+		return err
+	}
+
+	// Materialize all input rows
+	for {
+		row, err := op.input.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		op.buffer = append(op.buffer, row)
+	}
+
+	// Sort using multi-key comparison
+	sort.Slice(op.buffer, func(i, j int) bool {
+		return op.compareRows(op.buffer[i], op.buffer[j]) < 0
+	})
+
+	op.resultIdx = 0
+	return nil
+}
+
+func (op *PhysicalSort) Next() (storage.Row, error) {
+	if op.resultIdx >= len(op.buffer) {
+		return nil, io.EOF
+	}
+	row := op.buffer[op.resultIdx]
+	op.resultIdx++
+	return row, nil
+}
+
+func (op *PhysicalSort) Close() error {
+	return op.input.Close()
+}
+
+func (op *PhysicalSort) Schema() *storage.Schema {
+	return op.schema
+}
+
+// compareRows compares two rows using multi-key sort semantics.
+// Returns -1 if a < b, 0 if a == b, 1 if a > b.
+func (op *PhysicalSort) compareRows(a, b storage.Row) int {
+	for _, key := range op.sortKeys {
+		aVal := a[key.ColIndex]
+		bVal := b[key.ColIndex]
+
+		// Use storage.CompareValues for type-aware comparison
+		cmp := storage.CompareValues(aVal, bVal)
+
+		// Apply direction
+		if key.Direction == "DESC" {
+			cmp = -cmp
+		}
+
+		// If values differ, we have our ordering
+		if cmp != 0 {
+			return cmp
+		}
+		// Otherwise, continue to next sort key
+	}
+
+	// All sort keys are equal
+	return 0
+}
+
+// ---- PhysicalDistinct ---------------------------------------------------------
+
+// PhysicalDistinct removes duplicate rows from input.
+// This is a materializing operator (buffers all unique rows).
+type PhysicalDistinct struct {
+	input     PhysicalOperator
+	schema    *storage.Schema
+
+	seenRows  map[string]struct{} // Hash set of seen row keys
+	buffer    []storage.Row        // Materialized unique rows
+	resultIdx int                  // Current position
+}
+
+func NewPhysicalDistinct(input PhysicalOperator) *PhysicalDistinct {
+	return &PhysicalDistinct{
+		input:    input,
+		schema:   input.Schema(),
+		seenRows: make(map[string]struct{}),
+		buffer:   make([]storage.Row, 0),
+	}
+}
+
+func (op *PhysicalDistinct) Open() error {
+	if err := op.input.Open(); err != nil {
+		return err
+	}
+
+	// Materialize all input rows, deduplicating as we go
+	for {
+		row, err := op.input.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		// Build hash key for this row
+		rowKey := op.buildRowKey(row)
+
+		// Check if we've seen this row before
+		if _, seen := op.seenRows[rowKey]; !seen {
+			// New unique row - add to buffer and mark as seen
+			op.seenRows[rowKey] = struct{}{}
+			op.buffer = append(op.buffer, row)
+		}
+		// Skip duplicate rows
+	}
+
+	op.resultIdx = 0
+	return nil
+}
+
+func (op *PhysicalDistinct) Next() (storage.Row, error) {
+	if op.resultIdx >= len(op.buffer) {
+		return nil, io.EOF
+	}
+	row := op.buffer[op.resultIdx]
+	op.resultIdx++
+	return row, nil
+}
+
+func (op *PhysicalDistinct) Close() error {
+	return op.input.Close()
+}
+
+func (op *PhysicalDistinct) Schema() *storage.Schema {
+	return op.schema
+}
+
+// buildRowKey creates a unique string key for a row.
+// Uses the same approach as PhysicalAggregate.buildGroupKey (line 764-780).
+//
+// CRITICAL NULL HANDLING:
+// - For DISTINCT, NULL == NULL (SQL semantics)
+// - Use special marker "<NULL>" to represent NULL values
+// - Ensures two rows with NULL in same column are considered equal
+func (op *PhysicalDistinct) buildRowKey(row storage.Row) string {
+	var key strings.Builder
+	for i, val := range row {
+		if i > 0 {
+			key.WriteString("|") // delimiter
+		}
+
+		if val.IsNull() {
+			key.WriteString("<NULL>") // Special marker for NULL
+		} else {
+			key.WriteString(val.String())
+		}
+	}
+	return key.String()
+}
+
+// ---- Helper Functions ---------------------------------------------------------
+
 // addValues adds two numeric values.
 func addValues(a, b storage.Value) storage.Value {
 	switch a.Kind() {
@@ -896,4 +1090,136 @@ func rowsEqual(a, b storage.Row) bool {
 		}
 	}
 	return true
+}
+
+// ---- PhysicalDropTable --------------------------------------------------------
+
+type PhysicalDropTable struct {
+	db        *storage.DB
+	tableName string
+	done      bool
+}
+
+func NewPhysicalDropTable(db *storage.DB, tableName string) *PhysicalDropTable {
+	return &PhysicalDropTable{db: db, tableName: tableName}
+}
+
+func (op *PhysicalDropTable) Open() error {
+	err := op.db.DropTable(op.tableName)
+	op.done = false
+	return err
+}
+
+func (op *PhysicalDropTable) Next() (storage.Row, error) {
+	if op.done {
+		return nil, io.EOF
+	}
+	op.done = true
+	return storage.Row{storage.NewVarcharValue(fmt.Sprintf("Table '%s' dropped", op.tableName))}, nil
+}
+
+func (op *PhysicalDropTable) Close() error { return nil }
+
+func (op *PhysicalDropTable) Schema() *storage.Schema {
+	s, _ := storage.NewSchema([]storage.Column{{Name: "message", Type: storage.TypeVARCHAR, MaxLen: 255}})
+	return s
+}
+
+// ---- PhysicalCreateDatabase --------------------------------------------------
+
+type PhysicalCreateDatabase struct {
+	db     *storage.DB
+	dbName string
+	done   bool
+}
+
+func NewPhysicalCreateDatabase(db *storage.DB, dbName string) *PhysicalCreateDatabase {
+	return &PhysicalCreateDatabase{db: db, dbName: dbName}
+}
+
+func (op *PhysicalCreateDatabase) Open() error {
+	op.done = false
+	return storage.CreateDatabase(filepath.Dir(op.db.Dir()), op.dbName)
+}
+
+func (op *PhysicalCreateDatabase) Next() (storage.Row, error) {
+	if op.done {
+		return nil, io.EOF
+	}
+	op.done = true
+	return storage.Row{storage.NewVarcharValue(fmt.Sprintf("Database '%s' created", op.dbName))}, nil
+}
+
+func (op *PhysicalCreateDatabase) Close() error { return nil }
+
+func (op *PhysicalCreateDatabase) Schema() *storage.Schema {
+	s, _ := storage.NewSchema([]storage.Column{{Name: "message", Type: storage.TypeVARCHAR, MaxLen: 255}})
+	return s
+}
+
+// ---- PhysicalRenameDatabase --------------------------------------------------
+
+type PhysicalRenameDatabase struct {
+	db      *storage.DB
+	oldName string
+	newName string
+	done    bool
+}
+
+func NewPhysicalRenameDatabase(db *storage.DB, oldName, newName string) *PhysicalRenameDatabase {
+	return &PhysicalRenameDatabase{db: db, oldName: oldName, newName: newName}
+}
+
+func (op *PhysicalRenameDatabase) Open() error {
+	op.done = false
+	return storage.RenameDatabase(filepath.Dir(op.db.Dir()), op.oldName, op.newName)
+}
+
+func (op *PhysicalRenameDatabase) Next() (storage.Row, error) {
+	if op.done {
+		return nil, io.EOF
+	}
+	op.done = true
+	return storage.Row{storage.NewVarcharValue(
+		fmt.Sprintf("Database '%s' renamed to '%s'", op.oldName, op.newName),
+	)}, nil
+}
+
+func (op *PhysicalRenameDatabase) Close() error { return nil }
+
+func (op *PhysicalRenameDatabase) Schema() *storage.Schema {
+	s, _ := storage.NewSchema([]storage.Column{{Name: "message", Type: storage.TypeVARCHAR, MaxLen: 255}})
+	return s
+}
+
+// ---- PhysicalDropDatabase ----------------------------------------------------
+
+type PhysicalDropDatabase struct {
+	db     *storage.DB
+	dbName string
+	done   bool
+}
+
+func NewPhysicalDropDatabase(db *storage.DB, dbName string) *PhysicalDropDatabase {
+	return &PhysicalDropDatabase{db: db, dbName: dbName}
+}
+
+func (op *PhysicalDropDatabase) Open() error {
+	op.done = false
+	return storage.DropDatabase(filepath.Dir(op.db.Dir()), op.dbName)
+}
+
+func (op *PhysicalDropDatabase) Next() (storage.Row, error) {
+	if op.done {
+		return nil, io.EOF
+	}
+	op.done = true
+	return storage.Row{storage.NewVarcharValue(fmt.Sprintf("Database '%s' dropped", op.dbName))}, nil
+}
+
+func (op *PhysicalDropDatabase) Close() error { return nil }
+
+func (op *PhysicalDropDatabase) Schema() *storage.Schema {
+	s, _ := storage.NewSchema([]storage.Column{{Name: "message", Type: storage.TypeVARCHAR, MaxLen: 255}})
+	return s
 }

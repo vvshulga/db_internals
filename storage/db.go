@@ -282,6 +282,58 @@ func (db *DB) TableNames() []string {
 	return names
 }
 
+// Dir returns the database directory path.
+func (db *DB) Dir() string {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.dir
+}
+
+// CreateDatabase creates a new database directory at filepath.Join(parentDir, name).
+// Returns ErrDatabaseExists if the directory already exists.
+func CreateDatabase(parentDir, name string) error {
+	target := filepath.Join(parentDir, name)
+	if _, err := os.Stat(target); err == nil {
+		return &ErrDatabaseExists{Name: name}
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		return fmt.Errorf("storage.CreateDatabase %q: %w", name, err)
+	}
+	return nil
+}
+
+// DropDatabase removes the database directory at filepath.Join(parentDir, name)
+// and all its contents. Returns ErrDatabaseNotFound if the directory does not exist.
+func DropDatabase(parentDir, name string) error {
+	target := filepath.Join(parentDir, name)
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		return &ErrDatabaseNotFound{Name: name}
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return fmt.Errorf("storage.DropDatabase %q: %w", name, err)
+	}
+	return nil
+}
+
+// RenameDatabase renames the database directory from filepath.Join(parentDir, oldName)
+// to filepath.Join(parentDir, newName).
+// Returns ErrDatabaseNotFound if the source does not exist.
+// Returns ErrDatabaseExists if the destination already exists.
+func RenameDatabase(parentDir, oldName, newName string) error {
+	src := filepath.Join(parentDir, oldName)
+	dst := filepath.Join(parentDir, newName)
+	if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
+		return &ErrDatabaseNotFound{Name: oldName}
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return &ErrDatabaseExists{Name: newName}
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("storage.RenameDatabase %q -> %q: %w", oldName, newName, err)
+	}
+	return nil
+}
+
 // ---- persistence helpers --------------------------------------------------------
 
 func (db *DB) loadCatalog() error {

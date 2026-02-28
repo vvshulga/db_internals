@@ -38,7 +38,7 @@ func (t *TableHandle) Insert(row Row) (RID, error) {
 			// Best-effort rollback: remove the heap row. We do not roll back
 			// other indexes already updated in this loop — a proper WAL is
 			// needed for atomic multi-index updates (out of scope).
-			_ = t.heap.Delete(rid)
+			_ = t.heap.Delete(t.schema, rid)
 			return RID{}, err
 		}
 	}
@@ -118,7 +118,7 @@ func (t *TableHandle) Delete(rid RID) (bool, error) {
 		}
 	}
 
-	err := t.heap.Delete(rid)
+	err := t.heap.Delete(t.schema, rid)
 	if err == nil {
 		for _, idx := range t.indexes {
 			idx.Delete(oldRow[idx.colIndex], rid)

@@ -484,3 +484,415 @@ func TestParseGroupByErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseOrderBy(t *testing.T) {
+	cases := []struct {
+		name     string
+		query    string
+		expected int // Expected number of ORDER BY clauses
+	}{
+		{"single ASC", "SELECT * FROM users ORDER BY name ASC", 1},
+		{"single DESC", "SELECT * FROM users ORDER BY age DESC", 1},
+		{"default ASC", "SELECT * FROM users ORDER BY id", 1},
+		{"multiple", "SELECT * FROM users ORDER BY dept ASC, salary DESC", 2},
+		{"with WHERE", "SELECT * FROM users WHERE active = 1 ORDER BY name", 1},
+		{"with GROUP BY", "SELECT dept, COUNT(*) FROM users GROUP BY dept ORDER BY dept", 1},
+		{"full query", "SELECT * FROM users WHERE age > 18 ORDER BY name ASC LIMIT 10", 1},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			nodes, err := ParseString(c.query)
+			if err != nil {
+				t.Fatalf("ParseString(%q) failed: %v", c.query, err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node, got %d", len(nodes))
+			}
+
+			sel, ok := nodes[0].(*SelectStmt)
+			if !ok {
+				t.Fatalf("expected SelectStmt, got %T", nodes[0])
+			}
+
+			if len(sel.OrderBy) != c.expected {
+				t.Errorf("expected %d ORDER BY clauses, got %d", c.expected, len(sel.OrderBy))
+			}
+		})
+	}
+}
+
+func TestParseOrderByStructure(t *testing.T) {
+	sql := "SELECT * FROM users ORDER BY dept ASC, salary DESC"
+	nodes, err := ParseString(sql)
+	if err != nil {
+		t.Fatalf("ParseString failed: %v", err)
+	}
+
+	sel, ok := nodes[0].(*SelectStmt)
+	if !ok {
+		t.Fatalf("expected SelectStmt, got %T", nodes[0])
+	}
+
+	if len(sel.OrderBy) != 2 {
+		t.Fatalf("expected 2 ORDER BY clauses, got %d", len(sel.OrderBy))
+	}
+
+	if sel.OrderBy[0].Column != "dept" || sel.OrderBy[0].Direction != "ASC" {
+		t.Errorf("expected first ORDER BY to be 'dept ASC', got '%s %s'",
+			sel.OrderBy[0].Column, sel.OrderBy[0].Direction)
+	}
+
+	if sel.OrderBy[1].Column != "salary" || sel.OrderBy[1].Direction != "DESC" {
+		t.Errorf("expected second ORDER BY to be 'salary DESC', got '%s %s'",
+			sel.OrderBy[1].Column, sel.OrderBy[1].Direction)
+	}
+}
+
+func TestParseOrderByErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"missing BY", "SELECT * FROM users ORDER"},
+		{"missing column", "SELECT * FROM users ORDER BY"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if err == nil {
+				t.Errorf("expected error for %q but got none", c.query)
+			}
+		})
+	}
+}
+
+func TestParseDistinct(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		distinct bool
+	}{
+		{"basic DISTINCT", "SELECT DISTINCT name FROM users", true},
+		{"no DISTINCT", "SELECT name FROM users", false},
+		{"DISTINCT with WHERE", "SELECT DISTINCT dept FROM employees WHERE active = 1", true},
+		{"DISTINCT with ORDER BY", "SELECT DISTINCT name FROM users ORDER BY name", true},
+		{"DISTINCT *", "SELECT DISTINCT * FROM products", true},
+		{"DISTINCT multiple columns", "SELECT DISTINCT dept, level FROM employees", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodes, err := ParseString(tt.sql)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			sel, ok := nodes[0].(*SelectStmt)
+			if !ok {
+				t.Fatalf("expected SelectStmt")
+			}
+			if sel.Distinct != tt.distinct {
+				t.Errorf("expected Distinct=%v, got %v", tt.distinct, sel.Distinct)
+			}
+		})
+	}
+}
+
+func TestParseCreateTableVarcharLength(t *testing.T) {
+	tests := []struct {
+		name        string
+		sql         string
+		expectError bool
+		validate    func(*testing.T, *CreateTableStmt)
+	}{
+		{
+			name:        "valid VARCHAR with length",
+			sql:         "CREATE TABLE users (name VARCHAR(64))",
+			expectError: false,
+			validate: func(t *testing.T, stmt *CreateTableStmt) {
+				if len(stmt.Columns) != 1 {
+					t.Fatalf("expected 1 column, got %d", len(stmt.Columns))
+				}
+				col := stmt.Columns[0]
+				if col.Type != "VARCHAR" {
+					t.Errorf("expected type VARCHAR, got %s", col.Type)
+				}
+				if col.TypeLen == nil {
+					t.Error("expected TypeLen to be set")
+				} else if *col.TypeLen != 64 {
+					t.Errorf("expected length 64, got %d", *col.TypeLen)
+				}
+			},
+		},
+		{
+			name:        "VARCHAR length boundaries (min=1, max=65535)",
+			sql:         "CREATE TABLE t (a VARCHAR(1), b VARCHAR(65535))",
+			expectError: false,
+			validate: func(t *testing.T, stmt *CreateTableStmt) {
+				if *stmt.Columns[0].TypeLen != 1 {
+					t.Errorf("expected min length 1, got %d", *stmt.Columns[0].TypeLen)
+				}
+				if *stmt.Columns[1].TypeLen != 65535 {
+					t.Errorf("expected max length 65535, got %d", *stmt.Columns[1].TypeLen)
+				}
+			},
+		},
+		{
+			name:        "mixed column types",
+			sql:         "CREATE TABLE users (id INT, name VARCHAR(100), age BIGINT)",
+			expectError: false,
+			validate: func(t *testing.T, stmt *CreateTableStmt) {
+				if stmt.Columns[0].Type != "INT" {
+					t.Error("expected INT type")
+				}
+				if stmt.Columns[0].TypeLen != nil {
+					t.Error("INT should not have TypeLen")
+				}
+				if stmt.Columns[1].Type != "VARCHAR" {
+					t.Error("expected VARCHAR type")
+				}
+				if stmt.Columns[1].TypeLen == nil {
+					t.Error("VARCHAR should have TypeLen")
+				}
+				if stmt.Columns[2].Type != "BIGINT" {
+					t.Error("expected BIGINT type")
+				}
+				if stmt.Columns[2].TypeLen != nil {
+					t.Error("BIGINT should not have TypeLen")
+				}
+			},
+		},
+		{
+			name:        "VARCHAR without length",
+			sql:         "CREATE TABLE users (name VARCHAR)",
+			expectError: true,
+		},
+		{
+			name:        "VARCHAR with zero length",
+			sql:         "CREATE TABLE users (name VARCHAR(0))",
+			expectError: true,
+		},
+		{
+			name:        "VARCHAR length exceeds uint16 max",
+			sql:         "CREATE TABLE users (name VARCHAR(65536))",
+			expectError: true,
+		},
+		{
+			name:        "INT with length parameter (not allowed)",
+			sql:         "CREATE TABLE users (id INT(10))",
+			expectError: true,
+		},
+		{
+			name:        "VARCHAR missing closing paren",
+			sql:         "CREATE TABLE users (name VARCHAR(64)",
+			expectError: true,
+		},
+		{
+			name:        "VARCHAR non-numeric length",
+			sql:         "CREATE TABLE users (name VARCHAR(abc))",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodes, err := ParseString(tt.sql)
+
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node, got %d", len(nodes))
+			}
+
+			stmt, ok := nodes[0].(*CreateTableStmt)
+			if !ok {
+				t.Fatalf("expected CreateTableStmt, got %T", nodes[0])
+			}
+
+			if tt.validate != nil {
+				tt.validate(t, stmt)
+			}
+		})
+	}
+}
+
+func TestParseCreateTableNullableVarchar(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		validate func(*testing.T, *CreateTableStmt)
+	}{
+		{
+			name: "nullable VARCHAR with length",
+			sql:  "CREATE TABLE test (description VARCHAR(512)?)",
+			validate: func(t *testing.T, stmt *CreateTableStmt) {
+				if len(stmt.Columns) != 1 {
+					t.Fatalf("expected 1 column, got %d", len(stmt.Columns))
+				}
+				col := stmt.Columns[0]
+				if col.Type != "VARCHAR" {
+					t.Errorf("expected type VARCHAR, got %s", col.Type)
+				}
+				if col.TypeLen == nil {
+					t.Error("expected TypeLen to be set")
+				} else if *col.TypeLen != 512 {
+					t.Errorf("expected length 512, got %d", *col.TypeLen)
+				}
+				if !col.Nullable {
+					t.Error("expected Nullable to be true")
+				}
+			},
+		},
+		{
+			name: "nullable TEXT",
+			sql:  "CREATE TABLE test (description TEXT?)",
+			validate: func(t *testing.T, stmt *CreateTableStmt) {
+				col := stmt.Columns[0]
+				if col.Type != "TEXT" {
+					t.Errorf("expected type TEXT, got %s", col.Type)
+				}
+				if !col.Nullable {
+					t.Error("expected Nullable to be true")
+				}
+			},
+		},
+		{
+			name: "mixed nullable and non-nullable",
+			sql:  "CREATE TABLE test (name VARCHAR(64), description VARCHAR(512)?, age INT)",
+			validate: func(t *testing.T, stmt *CreateTableStmt) {
+				if len(stmt.Columns) != 3 {
+					t.Fatalf("expected 3 columns, got %d", len(stmt.Columns))
+				}
+				// name: non-nullable VARCHAR(64)
+				if stmt.Columns[0].Nullable {
+					t.Error("name should not be nullable")
+				}
+				// description: nullable VARCHAR(512)
+				if !stmt.Columns[1].Nullable {
+					t.Error("description should be nullable")
+				}
+				if *stmt.Columns[1].TypeLen != 512 {
+					t.Errorf("expected description length 512, got %d", *stmt.Columns[1].TypeLen)
+				}
+				// age: non-nullable INT
+				if stmt.Columns[2].Nullable {
+					t.Error("age should not be nullable")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodes, err := ParseString(tt.sql)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node, got %d", len(nodes))
+			}
+			stmt, ok := nodes[0].(*CreateTableStmt)
+			if !ok {
+				t.Fatalf("expected CreateTableStmt, got %T", nodes[0])
+			}
+			tt.validate(t, stmt)
+		})
+	}
+}
+
+func TestParseNewDDL(t *testing.T) {
+	t.Run("DROP TABLE", func(t *testing.T) {
+		nodes, err := ParseString("DROP TABLE users")
+		if err != nil {
+			t.Fatalf("ParseString: %v", err)
+		}
+		if len(nodes) != 1 {
+			t.Fatalf("expected 1 node, got %d", len(nodes))
+		}
+		stmt, ok := nodes[0].(*DropTableStmt)
+		if !ok {
+			t.Fatalf("expected *DropTableStmt, got %T", nodes[0])
+		}
+		if stmt.TableName != "users" {
+			t.Errorf("TableName: want 'users', got %q", stmt.TableName)
+		}
+	})
+
+	t.Run("CREATE DATABASE", func(t *testing.T) {
+		nodes, err := ParseString("CREATE DATABASE mydb")
+		if err != nil {
+			t.Fatalf("ParseString: %v", err)
+		}
+		stmt, ok := nodes[0].(*CreateDatabaseStmt)
+		if !ok {
+			t.Fatalf("expected *CreateDatabaseStmt, got %T", nodes[0])
+		}
+		if stmt.DBName != "mydb" {
+			t.Errorf("DBName: want 'mydb', got %q", stmt.DBName)
+		}
+	})
+
+	t.Run("DROP DATABASE", func(t *testing.T) {
+		nodes, err := ParseString("DROP DATABASE mydb")
+		if err != nil {
+			t.Fatalf("ParseString: %v", err)
+		}
+		stmt, ok := nodes[0].(*DropDatabaseStmt)
+		if !ok {
+			t.Fatalf("expected *DropDatabaseStmt, got %T", nodes[0])
+		}
+		if stmt.DBName != "mydb" {
+			t.Errorf("DBName: want 'mydb', got %q", stmt.DBName)
+		}
+	})
+
+	t.Run("RENAME DATABASE", func(t *testing.T) {
+		nodes, err := ParseString("RENAME DATABASE olddb TO newdb")
+		if err != nil {
+			t.Fatalf("ParseString: %v", err)
+		}
+		stmt, ok := nodes[0].(*RenameDatabaseStmt)
+		if !ok {
+			t.Fatalf("expected *RenameDatabaseStmt, got %T", nodes[0])
+		}
+		if stmt.OldName != "olddb" {
+			t.Errorf("OldName: want 'olddb', got %q", stmt.OldName)
+		}
+		if stmt.NewName != "newdb" {
+			t.Errorf("NewName: want 'newdb', got %q", stmt.NewName)
+		}
+	})
+}
+
+func TestParseNewDDLErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"drop table missing name", "DROP TABLE"},
+		{"drop database missing name", "DROP DATABASE"},
+		{"create database missing name", "CREATE DATABASE"},
+		{"rename database missing TO", "RENAME DATABASE olddb"},
+		{"rename database missing new name", "RENAME DATABASE olddb TO"},
+		{"drop unknown keyword", "DROP INDEX foo"},
+		{"create unknown keyword", "CREATE VIEW foo"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := ParseString(c.query)
+			if err == nil {
+				t.Errorf("expected error for %q, got nil", c.query)
+			}
+		})
+	}
+}

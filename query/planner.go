@@ -30,6 +30,14 @@ func (p *Planner) Plan(stmt parser.AstNode) (LogicalPlan, error) {
 		return p.planUpdate(s)
 	case *parser.DeleteStmt:
 		return p.planDelete(s)
+	case *parser.DropTableStmt:
+		return p.planDropTable(s)
+	case *parser.CreateDatabaseStmt:
+		return p.planCreateDatabase(s)
+	case *parser.RenameDatabaseStmt:
+		return p.planRenameDatabase(s)
+	case *parser.DropDatabaseStmt:
+		return p.planDropDatabase(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type %T", stmt)
 	}
@@ -90,7 +98,38 @@ func (p *Planner) planSelect(stmt *parser.SelectStmt) (LogicalPlan, error) {
 		}
 	}
 
-	// 5. Add LogicalLimit if specified
+	// 4.5 Add LogicalDistinct if DISTINCT specified
+	if stmt.Distinct {
+		plan = &LogicalDistinct{
+			Input: plan,
+		}
+	}
+
+	// 5. Add LogicalSort if ORDER BY exists
+	if len(stmt.OrderBy) > 0 {
+		// Validate ORDER BY columns against current schema
+		currentSchema := plan.Schema()
+		sortKeys := make([]SortKey, len(stmt.OrderBy))
+
+		for i, ob := range stmt.OrderBy {
+			// Check column exists
+			if _, ok := currentSchema.ColumnIndex(ob.Column); !ok {
+				return nil, &ErrUnknownColumn{Name: ob.Column}
+			}
+
+			sortKeys[i] = SortKey{
+				Column:    ob.Column,
+				Direction: ob.Direction,
+			}
+		}
+
+		plan = &LogicalSort{
+			Input:    plan,
+			SortKeys: sortKeys,
+		}
+	}
+
+	// 6. Add LogicalLimit if specified
 	if stmt.Limit != nil {
 		plan = &LogicalLimit{
 			Input: plan,
@@ -351,34 +390,31 @@ func (p *Planner) planCreateTable(stmt *parser.CreateTableStmt) (LogicalPlan, er
 	}, nil
 }
 
+func (p *Planner) planDropTable(stmt *parser.DropTableStmt) (LogicalPlan, error) {
+	return &LogicalDropTable{TableName: stmt.TableName}, nil
+}
+
+func (p *Planner) planCreateDatabase(stmt *parser.CreateDatabaseStmt) (LogicalPlan, error) {
+	return &LogicalCreateDatabase{DBName: stmt.DBName}, nil
+}
+
+func (p *Planner) planRenameDatabase(stmt *parser.RenameDatabaseStmt) (LogicalPlan, error) {
+	return &LogicalRenameDatabase{OldName: stmt.OldName, NewName: stmt.NewName}, nil
+}
+
+func (p *Planner) planDropDatabase(stmt *parser.DropDatabaseStmt) (LogicalPlan, error) {
+	return &LogicalDropDatabase{DBName: stmt.DBName}, nil
+}
+
 // convertColumnDef converts a parser column definition to a storage column.
 func convertColumnDef(c parser.ColumnDef) (storage.Column, error) {
 	col := storage.Column{
 		Name:     c.Name,
-		Nullable: true, // Default to nullable (parser doesn't track this yet)
+		Nullable: c.Nullable, // Use parsed nullable flag
 	}
 
-	// Handle VARCHAR(n) - extract size from type string
-	typeName := c.Type
-	var varcharLen int
-
-	// Check if type is VARCHAR(n)
-	if len(c.Type) > 7 && c.Type[:7] == "VARCHAR" {
-		// Extract size from VARCHAR(n)
-		if len(c.Type) > 8 && c.Type[7] == '(' {
-			endIdx := len(c.Type) - 1
-			if c.Type[endIdx] == ')' {
-				sizeStr := c.Type[8:endIdx]
-				if n, err := fmt.Sscanf(sizeStr, "%d", &varcharLen); err == nil && n == 1 {
-					typeName = "VARCHAR"
-					col.MaxLen = uint16(varcharLen)
-				}
-			}
-		}
-	}
-
-	// Map parser type string to storage type
-	switch typeName {
+	// Map parser type to storage type
+	switch c.Type {
 	case "INT":
 		col.Type = storage.TypeINT
 	case "BIGINT":
@@ -392,14 +428,15 @@ func convertColumnDef(c parser.ColumnDef) (storage.Column, error) {
 	case "DATETIME":
 		col.Type = storage.TypeDATETIME
 	case "VARCHAR":
-		col.Type = storage.TypeVARCHAR
-		if col.MaxLen == 0 {
-			return col, fmt.Errorf("VARCHAR requires MaxLen > 0")
+		if c.TypeLen == nil {
+			return storage.Column{}, fmt.Errorf("VARCHAR column %q missing length", c.Name)
 		}
+		col.Type = storage.TypeVARCHAR
+		col.MaxLen = *c.TypeLen
 	case "TEXT":
 		col.Type = storage.TypeTEXT
 	default:
-		return col, fmt.Errorf("unknown type %s", c.Type)
+		return storage.Column{}, fmt.Errorf("unknown type %q for column %q", c.Type, c.Name)
 	}
 
 	return col, nil

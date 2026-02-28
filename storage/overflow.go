@@ -14,8 +14,37 @@ import (
 // Available bytes = PageSize − HeaderSize − SlotSize − 8 (NextPageID) = 8161.
 const overflowChunkSize = PageSize - HeaderSize - SlotSize - 8
 
-// writeOverflowChain writes data to a contiguous run of freshly-allocated
-// OverflowPages, returning the global page ID of the first page.
+// allocateFreePage returns a page ID to use for a new overflow page.
+// It pops from the free list when available, otherwise increments TotalPages.
+// The caller must hold h.mu.
+func allocateFreePage(h *HeapFile) (uint64, error) {
+	if h.meta.FreeListHead == 0 {
+		id := h.meta.TotalPages
+		h.meta.TotalPages++
+		h.metaDirty = true
+		return id, nil
+	}
+	// Pop from the free list.
+	pageID := h.meta.FreeListHead
+	pg, err := h.readPage(pageID)
+	if err != nil {
+		return 0, fmt.Errorf("allocateFreePage: read page %d: %w", pageID, err)
+	}
+	body, err := pg.GetTuple(0)
+	if err != nil {
+		return 0, fmt.Errorf("allocateFreePage: slot 0 on page %d: %w", pageID, err)
+	}
+	if len(body) < 8 {
+		return 0, fmt.Errorf("allocateFreePage: corrupt free page %d: body too short", pageID)
+	}
+	h.meta.FreeListHead = binary.LittleEndian.Uint64(body[:8])
+	h.metaDirty = true
+	return pageID, nil
+}
+
+// writeOverflowChain writes data to overflow pages, returning the global page
+// ID of the first page in the chain. Pages are allocated via allocateFreePage,
+// which reuses freed pages before growing the file.
 //
 // The chain is singly-linked: each page's slot-0 body starts with the next
 // page's ID (0 = last). The caller must hold h.mu.
@@ -24,7 +53,16 @@ func writeOverflowChain(h *HeapFile, data []byte) (uint64, error) {
 	if numPages == 0 {
 		numPages = 1 // even an empty value occupies one page
 	}
-	firstPageID := h.meta.TotalPages
+
+	// Allocate all page IDs upfront (from free list or fresh).
+	pageIDs := make([]uint64, numPages)
+	for i := range pageIDs {
+		id, err := allocateFreePage(h)
+		if err != nil {
+			return 0, err
+		}
+		pageIDs[i] = id
+	}
 
 	// Write pages in reverse order (last → first) so each page knows the ID
 	// of its successor before it is written.
@@ -38,14 +76,14 @@ func writeOverflowChain(h *HeapFile, data []byte) (uint64, error) {
 
 		var nextPageID uint64
 		if i < numPages-1 {
-			nextPageID = firstPageID + uint64(i+1)
+			nextPageID = pageIDs[i+1]
 		}
 
 		body := make([]byte, 8+len(chunk))
 		binary.LittleEndian.PutUint64(body, nextPageID)
 		copy(body[8:], chunk)
 
-		pg := NewPage(firstPageID+uint64(i), OverflowPage)
+		pg := NewPage(pageIDs[i], OverflowPage)
 		if _, err := pg.InsertTuple(body); err != nil {
 			return 0, fmt.Errorf("writeOverflowChain page %d: %w", i, err)
 		}
@@ -54,10 +92,7 @@ func writeOverflowChain(h *HeapFile, data []byte) (uint64, error) {
 		}
 	}
 
-	// Commit the new page count (deferred write until Close/Flush).
-	h.meta.TotalPages += uint64(numPages)
-	h.metaDirty = true
-	return firstPageID, nil
+	return pageIDs[0], nil
 }
 
 // countOverflowPages returns the number of pages in the overflow chain starting
@@ -305,8 +340,8 @@ func hasOverflowColumn(schema *Schema, data []byte) bool {
 }
 
 // scanOverflowPageIDs returns the first-page IDs of all overflow columns in
-// data. Used by heap.go when deleting rows to free overflow chains in the
-// future (currently a no-op stub; a freelist is needed for reclamation).
+// data. Used by freeRowOverflow to free overflow chains when rows are deleted
+// or updated.
 func scanOverflowPageIDs(schema *Schema, data []byte) []uint64 {
 	var ids []uint64
 	for vi := range schema.layout.varIndices {
@@ -321,11 +356,44 @@ func scanOverflowPageIDs(schema *Schema, data []byte) []uint64 {
 	return ids
 }
 
-// freeOverflowChain is a stub that marks overflow pages as freed.
-// A proper implementation requires a freelist page; until then, overflow pages
-// are leaked when their owning row is deleted or updated.
-func freeOverflowChain(_ *HeapFile, _ uint64) error {
-	// TODO: implement freelist-based reclamation.
+// freeOverflowChain returns all pages in the overflow chain starting at
+// firstPageID to the heap's free list so they can be reused by future writes.
+// Each freed page is rewritten as an 8-byte free-list link before being pushed
+// onto the head of the free list. The caller must hold h.mu.
+func freeOverflowChain(h *HeapFile, firstPageID uint64) error {
+	pageID := firstPageID
+	for pageID != 0 {
+		pg, err := h.readPage(pageID)
+		if err != nil {
+			return fmt.Errorf("freeOverflowChain: read page %d: %w", pageID, err)
+		}
+		body, err := pg.GetTuple(0)
+		if err != nil {
+			return fmt.Errorf("freeOverflowChain: slot 0 on page %d: %w", pageID, err)
+		}
+		if len(body) < 8 {
+			return fmt.Errorf("freeOverflowChain: corrupt overflow page %d: body too short", pageID)
+		}
+
+		// Save the next overflow page ID before we overwrite slot 0.
+		nextPageID := binary.LittleEndian.Uint64(body[:8])
+
+		// Overwrite the first 8 bytes of slot-0's body in-place with the
+		// free-list link. Direct raw mutation (same package) keeps the slot
+		// entry intact so GetTuple(0) on a subsequent read returns the link.
+		// writePage recomputes the CRC32 checksum from pg.raw, so this is safe.
+		slotOffset := pg.slots[0].Offset
+		binary.LittleEndian.PutUint64(pg.raw[slotOffset:slotOffset+8], h.meta.FreeListHead)
+		if err := h.writePage(pg); err != nil {
+			return fmt.Errorf("freeOverflowChain: write page %d: %w", pageID, err)
+		}
+
+		// Push this page onto the free list.
+		h.meta.FreeListHead = pageID
+		h.metaDirty = true
+
+		pageID = nextPageID
+	}
 	return nil
 }
 

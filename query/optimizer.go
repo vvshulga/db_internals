@@ -38,6 +38,18 @@ func (o *Optimizer) Optimize(plan LogicalPlan) (PhysicalOperator, error) {
 		return o.optimizeDelete(p)
 	case *LogicalAggregate:
 		return o.optimizeAggregate(p)
+	case *LogicalSort:
+		return o.optimizeSort(p)
+	case *LogicalDistinct:
+		return o.optimizeDistinct(p)
+	case *LogicalDropTable:
+		return o.optimizeDropTable(p)
+	case *LogicalCreateDatabase:
+		return o.optimizeCreateDatabase(p)
+	case *LogicalRenameDatabase:
+		return o.optimizeRenameDatabase(p)
+	case *LogicalDropDatabase:
+		return o.optimizeDropDatabase(p)
 	default:
 		return nil, fmt.Errorf("unsupported logical plan type %T", plan)
 	}
@@ -230,6 +242,22 @@ func (o *Optimizer) optimizeCreateTable(ct *LogicalCreateTable) (PhysicalOperato
 	return NewPhysicalCreateTable(o.db, ct.TableName, ct.Columns), nil
 }
 
+func (o *Optimizer) optimizeDropTable(dt *LogicalDropTable) (PhysicalOperator, error) {
+	return NewPhysicalDropTable(o.db, dt.TableName), nil
+}
+
+func (o *Optimizer) optimizeCreateDatabase(cd *LogicalCreateDatabase) (PhysicalOperator, error) {
+	return NewPhysicalCreateDatabase(o.db, cd.DBName), nil
+}
+
+func (o *Optimizer) optimizeRenameDatabase(rd *LogicalRenameDatabase) (PhysicalOperator, error) {
+	return NewPhysicalRenameDatabase(o.db, rd.OldName, rd.NewName), nil
+}
+
+func (o *Optimizer) optimizeDropDatabase(dd *LogicalDropDatabase) (PhysicalOperator, error) {
+	return NewPhysicalDropDatabase(o.db, dd.DBName), nil
+}
+
 // optimizeUpdate converts a logical update to a physical update.
 func (o *Optimizer) optimizeUpdate(upd *LogicalUpdate) (PhysicalOperator, error) {
 	table, err := o.db.OpenTable(upd.TableName)
@@ -309,4 +337,42 @@ func (o *Optimizer) optimizeAggregate(agg *LogicalAggregate) (PhysicalOperator, 
 	}
 
 	return NewPhysicalAggregate(input, groupByIndices, computations, agg.Schema()), nil
+}
+
+// optimizeSort converts a logical sort to a physical sort.
+func (o *Optimizer) optimizeSort(sort *LogicalSort) (PhysicalOperator, error) {
+	// Optimize the input plan
+	input, err := o.Optimize(sort.Input)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve column names to indices
+	inputSchema := input.Schema()
+	physicalKeys := make([]SortKeyPhysical, len(sort.SortKeys))
+
+	for i, key := range sort.SortKeys {
+		idx, ok := inputSchema.ColumnIndex(key.Column)
+		if !ok {
+			return nil, &ErrUnknownColumn{Name: key.Column}
+		}
+
+		physicalKeys[i] = SortKeyPhysical{
+			ColIndex:  idx,
+			Direction: key.Direction,
+		}
+	}
+
+	return NewPhysicalSort(input, physicalKeys), nil
+}
+
+// optimizeDistinct converts a logical distinct to a physical distinct.
+func (o *Optimizer) optimizeDistinct(distinct *LogicalDistinct) (PhysicalOperator, error) {
+	// Optimize the input plan
+	input, err := o.Optimize(distinct.Input)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewPhysicalDistinct(input), nil
 }

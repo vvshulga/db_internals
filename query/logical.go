@@ -111,6 +111,47 @@ func (c *LogicalCreateTable) String() string {
 	return fmt.Sprintf("CreateTable(%s, %d columns)", c.TableName, len(c.Columns))
 }
 
+// LogicalDropTable represents a DROP TABLE statement.
+type LogicalDropTable struct {
+	TableName string
+}
+
+func (d *LogicalDropTable) Schema() *storage.Schema { return nil }
+func (d *LogicalDropTable) String() string {
+	return fmt.Sprintf("DropTable(%s)", d.TableName)
+}
+
+// LogicalCreateDatabase represents a CREATE DATABASE statement.
+type LogicalCreateDatabase struct {
+	DBName string
+}
+
+func (c *LogicalCreateDatabase) Schema() *storage.Schema { return nil }
+func (c *LogicalCreateDatabase) String() string {
+	return fmt.Sprintf("CreateDatabase(%s)", c.DBName)
+}
+
+// LogicalRenameDatabase represents a RENAME DATABASE statement.
+type LogicalRenameDatabase struct {
+	OldName string
+	NewName string
+}
+
+func (r *LogicalRenameDatabase) Schema() *storage.Schema { return nil }
+func (r *LogicalRenameDatabase) String() string {
+	return fmt.Sprintf("RenameDatabase(%s -> %s)", r.OldName, r.NewName)
+}
+
+// LogicalDropDatabase represents a DROP DATABASE statement.
+type LogicalDropDatabase struct {
+	DBName string
+}
+
+func (d *LogicalDropDatabase) Schema() *storage.Schema { return nil }
+func (d *LogicalDropDatabase) String() string {
+	return fmt.Sprintf("DropDatabase(%s)", d.DBName)
+}
+
 // LogicalUpdate represents an UPDATE statement.
 type LogicalUpdate struct {
 	Input     LogicalPlan             // Input rows to update (Scan + optional Filter)
@@ -168,6 +209,43 @@ func (a *LogicalAggregate) String() string {
 	}
 	return fmt.Sprintf("Aggregate(group_by=[%s], %d functions, %s)",
 		strings.Join(a.GroupByKeys, ", "), len(a.Aggregates), a.Input.String())
+}
+
+// LogicalSort represents an ORDER BY clause.
+type LogicalSort struct {
+	Input    LogicalPlan
+	SortKeys []SortKey
+}
+
+// SortKey represents a single sort column with direction.
+type SortKey struct {
+	Column    string // Column name
+	Direction string // "ASC" or "DESC"
+}
+
+func (s *LogicalSort) Schema() *storage.Schema {
+	return s.Input.Schema()
+}
+
+func (s *LogicalSort) String() string {
+	keys := make([]string, len(s.SortKeys))
+	for i, key := range s.SortKeys {
+		keys[i] = fmt.Sprintf("%s %s", key.Column, key.Direction)
+	}
+	return fmt.Sprintf("Sort([%s], %s)", strings.Join(keys, ", "), s.Input.String())
+}
+
+// LogicalDistinct represents a DISTINCT clause that removes duplicate rows.
+type LogicalDistinct struct {
+	Input LogicalPlan
+}
+
+func (d *LogicalDistinct) Schema() *storage.Schema {
+	return d.Input.Schema() // DISTINCT doesn't change schema, just filters rows
+}
+
+func (d *LogicalDistinct) String() string {
+	return fmt.Sprintf("Distinct(%s)", d.Input.String())
 }
 
 // formatExpr converts an expression to a string for display.

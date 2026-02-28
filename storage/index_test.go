@@ -1,8 +1,12 @@
 package storage
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -518,5 +522,149 @@ func TestIndexUniquePersistedOnReload(t *testing.T) {
 		if rid2 == savedRID {
 			t.Fatal("Insert: got same RID for different row")
 		}
+	}
+}
+
+func TestIndex_ChecksumVerification(t *testing.T) {
+	dir := t.TempDir()
+
+	idx, err := OpenIndex(dir, "t", "id", 0, false)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+
+	// Insert data and save
+	if err := idx.Insert(NewIntValue(1), RID{PageID: 1, SlotID: 0}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if err := idx.Insert(NewIntValue(2), RID{PageID: 1, SlotID: 1}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Corrupt the index file (flip a byte in entries region)
+	path := filepath.Join(dir, "t.id.idx")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) < 20 {
+		t.Fatal("index file too short")
+	}
+	data[20] ^= 0xFF // corrupt one byte in entries
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Reopen - should fail checksum
+	_, err = OpenIndex(dir, "t", "id", 0, false)
+	if err == nil {
+		t.Fatal("expected checksum error, got nil")
+	}
+	if !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Errorf("expected 'checksum mismatch' in error, got: %v", err)
+	}
+}
+
+func TestIndex_V1Compatibility(t *testing.T) {
+	dir := t.TempDir()
+
+	// Manually create a v1 index file
+	path := filepath.Join(dir, "t.id.idx")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Write v1 header: [version:1] [unique:0] [reserved:6] [count:8]
+	var hdr [16]byte
+	hdr[0] = 1                                      // version 1
+	hdr[1] = 0                                      // not unique
+	binary.LittleEndian.PutUint64(hdr[8:], 2)      // 2 entries
+
+	if _, err := f.Write(hdr[:]); err != nil {
+		t.Fatalf("Write header: %v", err)
+	}
+
+	// Write 2 INT entries manually (RID + Kind + Value)
+	// Entry 1: RID{PageID:1, SlotID:0}, INT value 1
+	entry1 := make([]byte, 10+1+4) // RID(10) + Kind(1) + int32(4)
+	binary.LittleEndian.PutUint64(entry1[0:], 1)   // PageID
+	binary.LittleEndian.PutUint16(entry1[8:], 0)   // SlotID
+	entry1[10] = byte(KindInt)                      // Kind
+	binary.LittleEndian.PutUint32(entry1[11:], 1)  // Value=1
+	if _, err := f.Write(entry1); err != nil {
+		t.Fatalf("Write entry 1: %v", err)
+	}
+
+	// Entry 2: RID{PageID:1, SlotID:1}, INT value 2
+	entry2 := make([]byte, 10+1+4)
+	binary.LittleEndian.PutUint64(entry2[0:], 1)   // PageID
+	binary.LittleEndian.PutUint16(entry2[8:], 1)   // SlotID
+	entry2[10] = byte(KindInt)                      // Kind
+	binary.LittleEndian.PutUint32(entry2[11:], 2)  // Value=2
+	if _, err := f.Write(entry2); err != nil {
+		t.Fatalf("Write entry 2: %v", err)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Open with new code (should handle v1)
+	idx, err := OpenIndex(dir, "t", "id", 0, false)
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+	defer idx.Close()
+
+	if idx.Len() != 2 {
+		t.Errorf("expected 2 entries, got %d", idx.Len())
+	}
+
+	// Verify entries can be looked up
+	rids := idx.Lookup(NewIntValue(1))
+	if len(rids) != 1 || rids[0] != (RID{PageID: 1, SlotID: 0}) {
+		t.Errorf("unexpected lookup result for value 1: %v", rids)
+	}
+
+	// Now modify and checkpoint - should upgrade to v2
+	if err := idx.Insert(NewIntValue(3), RID{PageID: 1, SlotID: 2}); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	if err := idx.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatalf("Close after upgrade: %v", err)
+	}
+
+	// Read raw file to verify it's now v2
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) < 16 {
+		t.Fatal("index file too short")
+	}
+	version := data[0]
+	if version != 2 {
+		t.Errorf("expected version 2 after upgrade, got %d", version)
+	}
+
+	// Reopen and verify all 3 entries are there
+	idx2, err := OpenIndex(dir, "t", "id", 0, false)
+	if err != nil {
+		t.Fatalf("OpenIndex after upgrade: %v", err)
+	}
+	defer idx2.Close()
+
+	if idx2.Len() != 3 {
+		t.Errorf("expected 3 entries after upgrade, got %d", idx2.Len())
 	}
 }
