@@ -557,43 +557,55 @@ process exits.
 
 ## Web Admin (ui_admin)
 
-`ui_admin` is a browser-based administration tool for the database. A Go HTTP server
-exposes a REST API backed directly by the `storage` package; the React 18 + TypeScript
-frontend is compiled to static files and served by the same binary.
+`ui_admin` consists of two parts that run together:
 
-**Prerequisites**: Go 1.25+, Node.js 18+, npm
+- **Backend** (`ui_admin/backend/`) — Go HTTP server exposing a REST API backed by the `storage` package. Builds into `ui_admin/ui_admin_server`. **Go only, no Node.js required.**
+- **Frontend** (`ui_admin/frontend/`) — React 18 + TypeScript single-page app. Runs as a separate Vite dev server that proxies `/api/*` to the backend. **Requires Node.js 18+ and npm.**
 
-### Build
+### Build (backend only — no Node.js required)
+
+```bash
+cd ui_admin && make backend && cd ..
+# Produces ./ui_admin/ui_admin_server
+```
+
+### Build (full stack — requires Node.js)
 
 ```bash
 cd ui_admin && make all && cd ..
-# Produces ./ui_admin_server in the project root
+# Produces ./ui_admin/ui_admin_server  +  frontend/dist/ (static files)
 ```
 
-Or build everything at once from the project root:
+Or from the project root:
 
 ```bash
 make build-all
 ```
 
-### Run
+### Run (API server)
 
 ```bash
-DB_DIR=/path/to/database ./ui_admin_server
+DB_DIR=/path/to/database ./ui_admin/ui_admin_server
 # Server starting on :8080, database: /path/to/database
 ```
 
-Open http://localhost:8080. The `PORT` environment variable overrides the default port.
+The `PORT` environment variable overrides the default port.
 
-### Development mode
+### Run with React UI (requires Node.js)
 
 ```bash
-cd ui_admin
-DB_DIR=./testdata make dev-backend   # Terminal 1: Go API on :8080
-make dev-frontend                    # Terminal 2: Vite hot-reload on :5173
+# Terminal 1 — API backend
+DB_DIR=/path/to/database ./ui_admin/ui_admin_server
+
+# Terminal 2 — React frontend (proxies /api/* to :8080)
+cd ui_admin && make dev-frontend
 ```
 
-Navigate to http://localhost:5173. The Vite dev server proxies `/api/*` to the backend.
+Navigate to http://localhost:5173.
+
+### API endpoints
+
+Accessible directly at http://localhost:8080 without the frontend:
 
 ### API endpoints
 
@@ -648,25 +660,30 @@ An interactive end-to-end walkthrough using the daemon and the web admin UI.
 
 ```bash
 make build                            # Go binaries (dbserver, dbctl, seeddb, …)
-cd ui_admin && make all && cd ..      # ui_admin_server + React frontend
+cd ui_admin && make backend && cd ..  # REST API server (no Node.js required)
 ```
 
-**Step 2 — Start the database daemon:**
+> To also get the React UI, replace `make backend` with `make all` (requires Node.js 18+).
+> Steps 2–4 (daemon + CLI) work with `make build` alone.
+
+**Step 2 — Seed the database with sample data:**
+
+`seeddb` writes **directly to the storage layer** (not through the daemon), so it must
+run **before** the daemon starts. The bundled `ui_admin/seed.sql` creates five
+e-commerce tables (users, categories, products, orders, order_items) with ~75 rows.
+
+```bash
+./seeddb -db /tmp/demo -sql ui_admin/seed.sql
+```
+
+**Step 3 — Start the database daemon:**
 
 ```bash
 ./dbctl --dir /tmp/demo start
 # → dbserver started (pid XXXX, log: /tmp/demo/dbserver.log)
 ```
 
-**Step 3 — Seed the database with sample data:**
-
-`seeddb` reads a SQL file and runs `CREATE TABLE` / `INSERT` statements directly
-against the storage layer. The bundled `ui_admin/seed.sql` creates five e-commerce
-tables (users, categories, products, orders, order_items) with ~75 rows.
-
-```bash
-./seeddb -db /tmp/demo -sql ui_admin/seed.sql
-```
+The daemon loads the catalog from disk at startup, so it will see all tables seeded above.
 
 **Step 4 — Verify via CLI:**
 
@@ -682,7 +699,7 @@ tables (users, categories, products, orders, order_items) with ~75 rows.
 
 ```bash
 ./dbctl --dir /tmp/demo stop
-DB_DIR=/tmp/demo ./ui_admin_server
+DB_DIR=/tmp/demo ./ui_admin/ui_admin_server
 # → Server starting on :8080, database: /tmp/demo
 ```
 
