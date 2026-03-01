@@ -56,3 +56,16 @@ type SuccessResponse struct {
 type ErrorResponse struct {
 	Error string `json:"error"`
 }
+
+// QueryRequest is the payload for executing a SQL statement
+type QueryRequest struct {
+	SQL string `json:"sql"`
+}
+
+// QueryResponse returns the results of a SQL statement
+type QueryResponse struct {
+	Columns         []string        `json:"columns"`
+	Rows            [][]interface{} `json:"rows"`
+	RowCount        int             `json:"row_count"`
+	ExecutionTimeMs int64           `json:"execution_time_ms"`
+}

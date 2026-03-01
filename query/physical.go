@@ -1223,3 +1223,69 @@ func (op *PhysicalDropDatabase) Schema() *storage.Schema {
 	s, _ := storage.NewSchema([]storage.Column{{Name: "message", Type: storage.TypeVARCHAR, MaxLen: 255}})
 	return s
 }
+
+// ---- PhysicalShowTables ------------------------------------------------------
+
+type PhysicalShowTables struct {
+	db     *storage.DB
+	rows   []storage.Row
+	cursor int
+}
+
+func NewPhysicalShowTables(db *storage.DB) *PhysicalShowTables {
+	return &PhysicalShowTables{db: db}
+}
+
+func (op *PhysicalShowTables) Open() error {
+	names := op.db.TableNames()
+	op.rows = make([]storage.Row, len(names))
+	for i, n := range names {
+		op.rows[i] = storage.Row{storage.NewVarcharValue(n)}
+	}
+	op.cursor = 0
+	return nil
+}
+
+func (op *PhysicalShowTables) Next() (storage.Row, error) {
+	if op.cursor >= len(op.rows) {
+		return nil, io.EOF
+	}
+	row := op.rows[op.cursor]
+	op.cursor++
+	return row, nil
+}
+
+func (op *PhysicalShowTables) Close() error { return nil }
+
+func (op *PhysicalShowTables) Schema() *storage.Schema {
+	s, _ := storage.NewSchema([]storage.Column{{Name: "table_name", Type: storage.TypeVARCHAR, MaxLen: 255}})
+	return s
+}
+
+// ---- PhysicalShowDatabases ----------------------------------------------------
+
+type PhysicalShowDatabases struct {
+	db   *storage.DB
+	done bool
+}
+
+func NewPhysicalShowDatabases(db *storage.DB) *PhysicalShowDatabases {
+	return &PhysicalShowDatabases{db: db}
+}
+
+func (op *PhysicalShowDatabases) Open() error { op.done = false; return nil }
+
+func (op *PhysicalShowDatabases) Next() (storage.Row, error) {
+	if op.done {
+		return nil, io.EOF
+	}
+	op.done = true
+	return storage.Row{storage.NewVarcharValue(op.db.Dir())}, nil
+}
+
+func (op *PhysicalShowDatabases) Close() error { return nil }
+
+func (op *PhysicalShowDatabases) Schema() *storage.Schema {
+	s, _ := storage.NewSchema([]storage.Column{{Name: "database", Type: storage.TypeVARCHAR, MaxLen: 255}})
+	return s
+}

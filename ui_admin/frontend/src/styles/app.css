@@ -311,3 +311,91 @@ button.secondary:disabled:hover {
 button.danger:disabled:hover {
   background: #e74c3c;
 }
+
+/* SQL Console */
+.sql-textarea {
+  width: 100%;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 0.9rem;
+  padding: 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  resize: vertical;
+  min-height: 120px;
+  margin-top: 0.5rem;
+  display: block;
+  line-height: 1.5;
+}
+
+.sql-actions {
+  margin-top: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.sql-hint {
+  color: #999;
+  font-size: 0.85rem;
+  margin-left: 0.5rem;
+}
+
+.query-results {
+  margin-top: 1.5rem;
+}
+
+.results-table-wrap {
+  overflow-x: auto;
+  margin-top: 0.5rem;
+}
+
+/* Query History Panel */
+.history-panel {
+  margin-top: 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #f8f9fa;
+}
+
+.history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #ddd;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.history-header button {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+  margin-right: 0;
+}
+
+.history-list {
+  list-style: none;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.history-list li {
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+  border-bottom: 1px solid #eee;
+  font-size: 0.85rem;
+}
+
+.history-list li:last-child {
+  border-bottom: none;
+}
+
+.history-list li:hover {
+  background: #e9ecef;
+}
+
+.history-list code {
+  font-family: 'Courier New', Courier, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/vvshulga/db_internals/query"
 	"github.com/vvshulga/db_internals/storage"
 )
 
@@ -38,6 +40,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/info", s.handleGetInfo)
 	s.mux.HandleFunc("/api/tables", s.handleTables)
 	s.mux.HandleFunc("/api/tables/", s.handleTableOps)
+	s.mux.HandleFunc("/api/query", s.handleQuery)
 }
 
 // handleGetInfo returns database metadata
@@ -519,4 +522,54 @@ func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 // respondError writes a JSON error response
 func respondError(w http.ResponseWriter, status int, message string) {
 	respondJSON(w, status, ErrorResponse{Error: message})
+}
+
+// handleQuery executes a SQL statement and returns the result set
+func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req QueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+	if req.SQL == "" {
+		respondError(w, http.StatusBadRequest, "sql is required")
+		return
+	}
+
+	engine := query.NewEngine(s.db)
+	start := time.Now()
+	rs, err := engine.Execute(req.SQL)
+	elapsed := time.Since(start).Milliseconds()
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var columns []string
+	if rs.Schema != nil {
+		for i := 0; i < rs.Schema.NumColumns(); i++ {
+			columns = append(columns, rs.Schema.Column(i).Name)
+		}
+	}
+
+	resultRows := make([][]interface{}, len(rs.Rows))
+	for i, row := range rs.Rows {
+		cells := make([]interface{}, len(row))
+		for j, v := range row {
+			cells[j] = valueToJSON(v)
+		}
+		resultRows[i] = cells
+	}
+
+	respondJSON(w, http.StatusOK, QueryResponse{
+		Columns:         columns,
+		Rows:            resultRows,
+		RowCount:        len(rs.Rows),
+		ExecutionTimeMs: elapsed,
+	})
 }

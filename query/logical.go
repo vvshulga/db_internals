@@ -152,6 +152,18 @@ func (d *LogicalDropDatabase) String() string {
 	return fmt.Sprintf("DropDatabase(%s)", d.DBName)
 }
 
+// LogicalShowTables represents a SHOW TABLES statement.
+type LogicalShowTables struct{}
+
+func (s *LogicalShowTables) Schema() *storage.Schema { return nil }
+func (s *LogicalShowTables) String() string          { return "ShowTables" }
+
+// LogicalShowDatabases represents a SHOW DATABASES statement.
+type LogicalShowDatabases struct{}
+
+func (s *LogicalShowDatabases) Schema() *storage.Schema { return nil }
+func (s *LogicalShowDatabases) String() string          { return "ShowDatabases" }
+
 // LogicalUpdate represents an UPDATE statement.
 type LogicalUpdate struct {
 	Input     LogicalPlan             // Input rows to update (Scan + optional Filter)

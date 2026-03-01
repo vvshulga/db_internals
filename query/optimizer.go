@@ -50,6 +50,10 @@ func (o *Optimizer) Optimize(plan LogicalPlan) (PhysicalOperator, error) {
 		return o.optimizeRenameDatabase(p)
 	case *LogicalDropDatabase:
 		return o.optimizeDropDatabase(p)
+	case *LogicalShowTables:
+		return NewPhysicalShowTables(o.db), nil
+	case *LogicalShowDatabases:
+		return NewPhysicalShowDatabases(o.db), nil
 	default:
 		return nil, fmt.Errorf("unsupported logical plan type %T", plan)
 	}

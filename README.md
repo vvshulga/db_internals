@@ -562,6 +562,8 @@ process exits.
 - **Backend** (`ui_admin/backend/`) — Go HTTP server exposing a REST API backed by the `storage` package. Builds into `ui_admin/ui_admin_server`. **Go only, no Node.js required.**
 - **Frontend** (`ui_admin/frontend/`) — React 18 + TypeScript single-page app. Runs as a separate Vite dev server that proxies `/api/*` to the backend. **Requires Node.js 18+ and npm.**
 
+The frontend provides a full database management UI: table browsing with pagination and search, row CRUD (insert/edit/delete), table creation/deletion, and a **SQL console** for running arbitrary queries directly in the browser.
+
 ### Build (backend only — no Node.js required)
 
 ```bash
@@ -607,8 +609,6 @@ Navigate to http://localhost:5173.
 
 Accessible directly at http://localhost:8080 without the frontend:
 
-### API endpoints
-
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/info` | Database metadata (directory, table count) |
@@ -621,6 +621,7 @@ Accessible directly at http://localhost:8080 without the frontend:
 | `GET` | `/api/tables/:name/rows/:rid` | Get row by RID |
 | `PUT` | `/api/tables/:name/rows/:rid` | Update row |
 | `DELETE` | `/api/tables/:name/rows/:rid` | Delete row |
+| `POST` | `/api/query` | Execute a SQL statement |
 
 ---
 

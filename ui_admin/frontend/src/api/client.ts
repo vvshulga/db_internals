@@ -29,6 +29,13 @@ export interface RowsResponse {
   page_size: number;
 }
 
+export interface QueryResponse {
+  columns: string[];
+  rows: any[][];
+  row_count: number;
+  execution_time_ms: number;
+}
+
 export class ApiClient {
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
     const resp = await fetch(`${API_BASE}${path}`, {
@@ -88,6 +95,13 @@ export class ApiClient {
 
   async dropTable(name: string): Promise<{ success: boolean }> {
     return this.request(`/tables/${name}`, { method: 'DELETE' });
+  }
+
+  async executeQuery(sql: string): Promise<QueryResponse> {
+    return this.request('/query', {
+      method: 'POST',
+      body: JSON.stringify({ sql }),
+    });
   }
 }
 

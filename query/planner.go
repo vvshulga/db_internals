@@ -38,6 +38,10 @@ func (p *Planner) Plan(stmt parser.AstNode) (LogicalPlan, error) {
 		return p.planRenameDatabase(s)
 	case *parser.DropDatabaseStmt:
 		return p.planDropDatabase(s)
+	case *parser.ShowTablesStmt:
+		return &LogicalShowTables{}, nil
+	case *parser.ShowDatabasesStmt:
+		return &LogicalShowDatabases{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type %T", stmt)
 	}

@@ -12,18 +12,19 @@ export default function TableView() {
   const [error, setError] = useState<string | null>(null);
   const [editingRow, setEditingRow] = useState<RowData | null>(null);
   const [showInsert, setShowInsert] = useState(false);
+  const [hasNextPage, setHasNextPage] = useState(false);
 
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
 
-  // Search state
+  // Search state (filters current page in-memory)
   const [searchQuery, setSearchQuery] = useState('');
   const [searchColumn, setSearchColumn] = useState<string>('');
 
   useEffect(() => {
     loadData();
-  }, [name]);
+  }, [name, currentPage, pageSize]);
 
   const loadData = async () => {
     if (!name) return;
@@ -34,12 +35,11 @@ export default function TableView() {
     try {
       const [schemaData, rowsData] = await Promise.all([
         api.getTableSchema(name),
-        api.scanRows(name, 1, 1000), // Load more rows for client-side pagination
+        api.scanRows(name, currentPage, pageSize),
       ]);
       setSchema(schemaData);
       setRows(rowsData.rows);
-      setCurrentPage(1);
-      // Set default search column to first column
+      setHasNextPage(rowsData.rows.length === pageSize);
       if (schemaData.columns.length > 0 && !searchColumn) {
         setSearchColumn(schemaData.columns[0].name);
       }
@@ -66,7 +66,6 @@ export default function TableView() {
 
   const handleDelete = async (rid: string) => {
     if (!name || !confirm('Delete this row?')) return;
-
     try {
       await api.deleteRow(name, rid);
       await loadData();
@@ -75,41 +74,24 @@ export default function TableView() {
     }
   };
 
-  // Filter rows based on search query
-  const filteredRows = useMemo(() => {
-    if (!searchQuery.trim() || !searchColumn) {
-      return rows;
-    }
+  const handlePageSizeChange = (newSize: number) => {
+    setPageSize(newSize);
+    setCurrentPage(1);
+  };
 
-    const query = searchQuery.toLowerCase();
+  // Filter current page rows by search query (client-side, within loaded page)
+  const filteredRows = useMemo(() => {
+    if (!searchQuery.trim() || !searchColumn) return rows;
+    const q = searchQuery.toLowerCase();
     return rows.filter(row => {
       const value = row.values[searchColumn];
-      if (value === null || value === undefined) {
-        return 'null'.includes(query);
-      }
-      return String(value).toLowerCase().includes(query);
+      if (value === null || value === undefined) return 'null'.includes(q);
+      return String(value).toLowerCase().includes(q);
     });
   }, [rows, searchQuery, searchColumn]);
 
-  // Paginate filtered rows
-  const paginatedRows = useMemo(() => {
-    const startIndex = (currentPage - 1) * pageSize;
-    const endIndex = startIndex + pageSize;
-    return filteredRows.slice(startIndex, endIndex);
-  }, [filteredRows, currentPage, pageSize]);
-
-  const totalPages = Math.ceil(filteredRows.length / pageSize);
-
-  const handlePageChange = (page: number) => {
-    if (page >= 1 && page <= totalPages) {
-      setCurrentPage(page);
-    }
-  };
-
-  const handlePageSizeChange = (newSize: number) => {
-    setPageSize(newSize);
-    setCurrentPage(1); // Reset to first page
-  };
+  const rowStart = (currentPage - 1) * pageSize + 1;
+  const rowEnd = (currentPage - 1) * pageSize + rows.length;
 
   if (loading) return <div className="loading">Loading...</div>;
   if (error) return <div className="error">Error: {error}</div>;
@@ -139,24 +121,13 @@ export default function TableView() {
           </select>
           <input
             type="text"
-            placeholder="Search..."
+            placeholder="Search current page..."
             value={searchQuery}
-            onChange={(e) => {
-              setSearchQuery(e.target.value);
-              setCurrentPage(1); // Reset to first page on search
-            }}
+            onChange={(e) => setSearchQuery(e.target.value)}
             className="search-input"
           />
           {searchQuery && (
-            <button
-              className="secondary"
-              onClick={() => {
-                setSearchQuery('');
-                setCurrentPage(1);
-              }}
-            >
-              Clear
-            </button>
+            <button className="secondary" onClick={() => setSearchQuery('')}>Clear</button>
           )}
         </div>
 
@@ -167,17 +138,19 @@ export default function TableView() {
             onChange={(e) => handlePageSizeChange(Number(e.target.value))}
             className="page-size-select"
           >
-            <option value={10}>10 per page</option>
             <option value={25}>25 per page</option>
             <option value={50}>50 per page</option>
             <option value={100}>100 per page</option>
+            <option value={250}>250 per page</option>
           </select>
         </div>
       </div>
 
       <div className="results-info">
-        Showing {paginatedRows.length > 0 ? (currentPage - 1) * pageSize + 1 : 0} - {Math.min(currentPage * pageSize, filteredRows.length)} of {filteredRows.length} rows
-        {searchQuery && ` (filtered from ${rows.length} total)`}
+        {rows.length === 0
+          ? 'No rows'
+          : `Rows ${rowStart}–${rowEnd}`}
+        {searchQuery && ` · ${filteredRows.length} match${filteredRows.length !== 1 ? 'es' : ''} on this page`}
       </div>
 
       {filteredRows.length > 0 ? (
@@ -191,7 +164,7 @@ export default function TableView() {
               </tr>
             </thead>
             <tbody>
-              {paginatedRows.map(row => (
+              {filteredRows.map(row => (
                 <tr key={row.rid}>
                   <td><code>{row.rid}</code></td>
                   {schema.columns.map(col => (
@@ -210,74 +183,35 @@ export default function TableView() {
             </tbody>
           </table>
 
-          {totalPages > 1 && (
-            <div className="pagination">
-              <button
-                onClick={() => handlePageChange(1)}
-                disabled={currentPage === 1}
-                className="secondary"
-              >
-                First
-              </button>
-              <button
-                onClick={() => handlePageChange(currentPage - 1)}
-                disabled={currentPage === 1}
-                className="secondary"
-              >
-                Previous
-              </button>
-
-              <div className="page-numbers">
-                {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
-                  // Show pages around current page
-                  let pageNum;
-                  if (totalPages <= 5) {
-                    pageNum = i + 1;
-                  } else if (currentPage <= 3) {
-                    pageNum = i + 1;
-                  } else if (currentPage >= totalPages - 2) {
-                    pageNum = totalPages - 4 + i;
-                  } else {
-                    pageNum = currentPage - 2 + i;
-                  }
-
-                  return (
-                    <button
-                      key={pageNum}
-                      onClick={() => handlePageChange(pageNum)}
-                      className={currentPage === pageNum ? 'active' : 'secondary'}
-                    >
-                      {pageNum}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <button
-                onClick={() => handlePageChange(currentPage + 1)}
-                disabled={currentPage === totalPages}
-                className="secondary"
-              >
-                Next
-              </button>
-              <button
-                onClick={() => handlePageChange(totalPages)}
-                disabled={currentPage === totalPages}
-                className="secondary"
-              >
-                Last
-              </button>
-
-              <span className="page-info">
-                Page {currentPage} of {totalPages}
-              </span>
-            </div>
-          )}
+          <div className="pagination">
+            <button
+              onClick={() => setCurrentPage(1)}
+              disabled={currentPage === 1}
+              className="secondary"
+            >
+              First
+            </button>
+            <button
+              onClick={() => setCurrentPage(p => p - 1)}
+              disabled={currentPage === 1}
+              className="secondary"
+            >
+              Previous
+            </button>
+            <span className="page-info">Page {currentPage}</span>
+            <button
+              onClick={() => setCurrentPage(p => p + 1)}
+              disabled={!hasNextPage}
+              className="secondary"
+            >
+              Next
+            </button>
+          </div>
         </>
       ) : (
         <p>
           {searchQuery
-            ? `No rows match your search "${searchQuery}" in column "${searchColumn}".`
+            ? `No rows on this page match "${searchQuery}" in column "${searchColumn}".`
             : 'No rows in this table. Insert a row above to get started.'}
         </p>
       )}

@@ -3,6 +3,7 @@ import DatabaseInfo from './components/DatabaseInfo';
 import TableList from './components/TableList';
 import TableView from './components/TableView';
 import TableCreate from './components/TableCreate';
+import SqlConsole from './components/SqlConsole';
 
 function Navigation() {
   const location = useLocation();
@@ -16,6 +17,9 @@ function Navigation() {
         </Link>
         <Link to="/tables" className={location.pathname.startsWith('/tables') ? 'active' : ''}>
           Tables
+        </Link>
+        <Link to="/query" className={location.pathname === '/query' ? 'active' : ''}>
+          SQL
         </Link>
       </div>
     </nav>
@@ -33,6 +37,7 @@ function App() {
             <Route path="/tables" element={<TableList />} />
             <Route path="/tables/new" element={<TableCreate />} />
             <Route path="/tables/:name" element={<TableView />} />
+            <Route path="/query" element={<SqlConsole />} />
           </Routes>
         </main>
       </div>

@@ -98,6 +98,12 @@ type DropDatabaseStmt struct {
 	DBName string
 }
 
+// ShowTablesStmt: SHOW TABLES
+type ShowTablesStmt struct{}
+
+// ShowDatabasesStmt: SHOW DATABASES
+type ShowDatabasesStmt struct{}
+
 // Expr represents expressions in WHERE clauses and VALUES
 type Expr interface{}
 
@@ -232,6 +238,8 @@ func (p *parser) parseStatement() (AstNode, error) {
 			return p.parseDrop()
 		case "RENAME":
 			return p.parseRenameDatabase()
+		case "SHOW":
+			return p.parseShow()
 		}
 	}
 	return nil, fmt.Errorf("unsupported statement starting with %v", t.Value)
@@ -664,6 +672,23 @@ func (p *parser) parseRenameDatabase() (AstNode, error) {
 		return nil, fmt.Errorf("expected new database name after TO")
 	}
 	return &RenameDatabaseStmt{OldName: oldName, NewName: p.next().Value}, nil
+}
+
+func (p *parser) parseShow() (AstNode, error) {
+	p.next() // consume SHOW
+	t := p.peek()
+	if t == nil {
+		return nil, fmt.Errorf("expected TABLES or DATABASE after SHOW")
+	}
+	switch strings.ToUpper(t.Value) {
+	case "TABLES":
+		p.next()
+		return &ShowTablesStmt{}, nil
+	case "DATABASES":
+		p.next()
+		return &ShowDatabasesStmt{}, nil
+	}
+	return nil, fmt.Errorf("unsupported SHOW target: %s", t.Value)
 }
 
 // parseCreateTableBody parses: CREATE TABLE <name> (...)  (CREATE already consumed)
