@@ -1,6 +1,2 @@
 github.com/google/btree v1.1.3 h1:CVpQJjYgC4VbzxeGVHfvZrv1ctoYCAI8vbl07Fcxlyg=
 github.com/google/btree v1.1.3/go.mod h1:qOPhT0dTNdNzV6Z/lhRX0YXUafgPLFUh+gZMl761Gm4=
-github.com/vvshulga/db_internals v0.0.0-20260224201127-dc0e4aab0145 h1:V+6dQ3MEf4HX/q0/u2CumJjgghQywkuBlB2zavB6tAA=
-github.com/vvshulga/db_internals v0.0.0-20260224201127-dc0e4aab0145/go.mod h1:FteLhQqNvhkBTxHaF7gx7mtZhUftHT3kA0ZsUIKEkMc=
-github.com/vvshulga/db_internals v0.0.0-20260228175923-0b4efd0c17ba h1:/vYjz8S5FCzUlgCQBFyuuPW7Y0hBUcvsQzR22YKN6QE=
-github.com/vvshulga/db_internals v0.0.0-20260228175923-0b4efd0c17ba/go.mod h1:eaVZ8A7c8ay9g704n76BTMMybvIi251jw28R2f+MJOw=
