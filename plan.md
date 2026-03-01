@@ -447,3 +447,4 @@ Recommended Next Steps:
 1. Implement WAL (durability — most impactful for production readiness)
 2. Add JOIN support (SQL expressiveness — most impactful for usability)
 3. Add LRU buffer pool (performance — most impactful for scale)
+
