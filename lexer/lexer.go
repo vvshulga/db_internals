@@ -41,6 +41,7 @@ var keywords = map[string]bool{
 	"set":    true,
 
 	"show":     true,
+	"use":      true,
 	"update":   true,
 	"delete":   true,
 	"drop":     true,

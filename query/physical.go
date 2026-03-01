@@ -1265,22 +1265,36 @@ func (op *PhysicalShowTables) Schema() *storage.Schema {
 // ---- PhysicalShowDatabases ----------------------------------------------------
 
 type PhysicalShowDatabases struct {
-	db   *storage.DB
-	done bool
+	db     *storage.DB
+	rows   []storage.Row
+	cursor int
 }
 
 func NewPhysicalShowDatabases(db *storage.DB) *PhysicalShowDatabases {
 	return &PhysicalShowDatabases{db: db}
 }
 
-func (op *PhysicalShowDatabases) Open() error { op.done = false; return nil }
+func (op *PhysicalShowDatabases) Open() error {
+	parentDir := filepath.Dir(op.db.Dir())
+	names, err := storage.ListDatabases(parentDir)
+	if err != nil {
+		return err
+	}
+	op.rows = make([]storage.Row, len(names))
+	for i, n := range names {
+		op.rows[i] = storage.Row{storage.NewVarcharValue(n)}
+	}
+	op.cursor = 0
+	return nil
+}
 
 func (op *PhysicalShowDatabases) Next() (storage.Row, error) {
-	if op.done {
+	if op.cursor >= len(op.rows) {
 		return nil, io.EOF
 	}
-	op.done = true
-	return storage.Row{storage.NewVarcharValue(op.db.Dir())}, nil
+	row := op.rows[op.cursor]
+	op.cursor++
+	return row, nil
 }
 
 func (op *PhysicalShowDatabases) Close() error { return nil }

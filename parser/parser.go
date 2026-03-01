@@ -104,6 +104,9 @@ type ShowTablesStmt struct{}
 // ShowDatabasesStmt: SHOW DATABASES
 type ShowDatabasesStmt struct{}
 
+// UseDatabaseStmt: USE [DATABASE] <name>
+type UseDatabaseStmt struct{ DBName string }
+
 // Expr represents expressions in WHERE clauses and VALUES
 type Expr interface{}
 
@@ -240,6 +243,8 @@ func (p *parser) parseStatement() (AstNode, error) {
 			return p.parseRenameDatabase()
 		case "SHOW":
 			return p.parseShow()
+		case "USE":
+			return p.parseUseDatabase()
 		}
 	}
 	return nil, fmt.Errorf("unsupported statement starting with %v", t.Value)
@@ -672,6 +677,21 @@ func (p *parser) parseRenameDatabase() (AstNode, error) {
 		return nil, fmt.Errorf("expected new database name after TO")
 	}
 	return &RenameDatabaseStmt{OldName: oldName, NewName: p.next().Value}, nil
+}
+
+// parseUseDatabase parses: USE [DATABASE] <name>
+func (p *parser) parseUseDatabase() (AstNode, error) {
+	p.next() // consume USE
+	// consume optional DATABASE keyword
+	if t := p.peek(); t != nil && strings.ToUpper(t.Value) == "DATABASE" {
+		p.next()
+	}
+	name := p.peek()
+	if name == nil {
+		return nil, fmt.Errorf("expected database name after USE")
+	}
+	p.next()
+	return &UseDatabaseStmt{DBName: name.Value}, nil
 }
 
 func (p *parser) parseShow() (AstNode, error) {

@@ -3,6 +3,7 @@ package main
 // InfoResponse returns database metadata
 type InfoResponse struct {
 	DatabaseDir string   `json:"database_dir"`
+	CurrentDB   string   `json:"current_db"` // base name of the current database directory
 	TableCount  int      `json:"table_count"`
 	TableNames  []string `json:"table_names"`
 }
@@ -55,6 +56,11 @@ type SuccessResponse struct {
 // ErrorResponse is a generic error response
 type ErrorResponse struct {
 	Error string `json:"error"`
+}
+
+// SwitchDBRequest is the payload for POST /api/db/switch
+type SwitchDBRequest struct {
+	Name string `json:"name"`
 }
 
 // QueryRequest is the payload for executing a SQL statement

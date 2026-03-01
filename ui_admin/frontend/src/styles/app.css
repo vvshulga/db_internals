@@ -31,6 +31,27 @@ body {
   margin: 0;
 }
 
+.db-selector {
+  background: rgba(255, 255, 255, 0.15);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 14px;
+  cursor: pointer;
+  margin-left: auto; /* push nav-links to the right */
+}
+
+.db-selector:focus {
+  outline: none;
+  border-color: white;
+}
+
+.db-selector option {
+  background: #2c3e50;
+  color: white;
+}
+
 .nav-links {
   display: flex;
   gap: 1rem;

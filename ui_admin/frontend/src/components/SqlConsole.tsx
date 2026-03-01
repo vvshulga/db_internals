@@ -5,7 +5,11 @@ const HISTORY_KEY = 'sql_console_history';
 const MAX_HISTORY = 20;
 const RESULT_PAGE_SIZE = 50;
 
-export default function SqlConsole() {
+interface SqlConsoleProps {
+  onDBSwitch?: () => void; // called after a USE DATABASE succeeds so the navbar can refresh
+}
+
+export default function SqlConsole({ onDBSwitch }: SqlConsoleProps) {
   const [sql, setSql] = useState('');
   const [result, setResult] = useState<QueryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,6 +50,13 @@ export default function SqlConsole() {
       const r = await api.executeQuery(sql);
       setResult(r);
       addToHistory(sql);
+      // If the query was a USE DATABASE statement, refresh the navbar db list.
+      if (r.columns.length === 1 && r.columns[0] === 'message' && r.row_count === 1) {
+        const msg = String(r.rows[0]?.[0] ?? '');
+        if (msg.startsWith('Switched to database')) {
+          onDBSwitch?.();
+        }
+      }
     } catch (err: any) {
       setError(err.message);
     } finally {

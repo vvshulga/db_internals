@@ -6,28 +6,47 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/vvshulga/db_internals/parser"
 	"github.com/vvshulga/db_internals/query"
 	"github.com/vvshulga/db_internals/storage"
 )
 
 // Server holds the database and HTTP router
 type Server struct {
-	db  *storage.DB
-	mux *http.ServeMux
+	db        *storage.DB
+	parentDir string     // parent of db.Dir() — where sibling databases live
+	mu        sync.Mutex // guards db swaps
+	mux       *http.ServeMux
 }
 
 // NewServer creates a new HTTP server with routes
 func NewServer(db *storage.DB) *Server {
 	s := &Server{
-		db:  db,
-		mux: http.NewServeMux(),
+		db:        db,
+		parentDir: filepath.Dir(db.Dir()),
+		mux:       http.NewServeMux(),
 	}
 	s.registerRoutes()
 	return s
+}
+
+// switchDatabase closes the current DB and opens the one at dir.
+func (s *Server) switchDatabase(dir string) error {
+	newDB, err := storage.OpenDB(dir)
+	if err != nil {
+		return fmt.Errorf("cannot open database: %w", err)
+	}
+	s.mu.Lock()
+	old := s.db
+	s.db = newDB
+	s.mu.Unlock()
+	return old.Close()
 }
 
 // Router returns the HTTP handler
@@ -38,6 +57,8 @@ func (s *Server) Router() http.Handler {
 // registerRoutes sets up all HTTP routes
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/info", s.handleGetInfo)
+	s.mux.HandleFunc("/api/databases", s.handleDatabases)
+	s.mux.HandleFunc("/api/db/switch", s.handleSwitchDB)
 	s.mux.HandleFunc("/api/tables", s.handleTables)
 	s.mux.HandleFunc("/api/tables/", s.handleTableOps)
 	s.mux.HandleFunc("/api/query", s.handleQuery)
@@ -54,11 +75,55 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 
 	resp := InfoResponse{
 		DatabaseDir: s.db.Dir(),
+		CurrentDB:   filepath.Base(s.db.Dir()),
 		TableCount:  len(tableNames),
 		TableNames:  tableNames,
 	}
 
 	respondJSON(w, http.StatusOK, resp)
+}
+
+// handleDatabases returns the list of all databases in the parent directory (GET only).
+func (s *Server) handleDatabases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		respondError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	names, err := storage.ListDatabases(s.parentDir)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to list databases: %v", err))
+		return
+	}
+	if names == nil {
+		names = []string{}
+	}
+	respondJSON(w, http.StatusOK, names)
+}
+
+// handleSwitchDB switches the active database (POST only).
+func (s *Server) handleSwitchDB(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	var req SwitchDBRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+	if req.Name == "" || strings.ContainsAny(req.Name, "/\\") {
+		respondError(w, http.StatusBadRequest, "Invalid database name")
+		return
+	}
+	newDir := filepath.Join(s.parentDir, req.Name)
+	if err := s.switchDatabase(newDir); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, SuccessResponse{
+		Success: true,
+		Message: fmt.Sprintf("Switched to database '%s'", req.Name),
+	})
 }
 
 // handleTables handles GET (list tables) and POST (create table)
@@ -539,6 +604,23 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if req.SQL == "" {
 		respondError(w, http.StatusBadRequest, "sql is required")
 		return
+	}
+
+	// Intercept USE [DATABASE] <name> before passing to the query engine.
+	if nodes, parseErr := parser.ParseString(req.SQL); parseErr == nil && len(nodes) == 1 {
+		if use, ok := nodes[0].(*parser.UseDatabaseStmt); ok {
+			newDir := filepath.Join(s.parentDir, use.DBName)
+			if err := s.switchDatabase(newDir); err != nil {
+				respondError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			respondJSON(w, http.StatusOK, QueryResponse{
+				Columns:  []string{"message"},
+				Rows:     [][]interface{}{{"Switched to database '" + use.DBName + "'"}},
+				RowCount: 1,
+			})
+			return
+		}
 	}
 
 	engine := query.NewEngine(s.db)

@@ -29,7 +29,7 @@ Education project for the DB Internals CS osvita course. Implements an OLTP row-
 git clone https://github.com/vvshulga/db_internals.git
 cd db_internals
 go test -race ./...            # run all tests
-make build                     # build all CLI/daemon binaries
+make build                     # build all Go binaries (including ui_admin_server)
 ./db_internals /tmp/mydb "SELECT * FROM users WHERE id = 1"
 ```
 
@@ -291,13 +291,14 @@ Segment file (<table>.N.heap)
 │   DATETIME  → 8 bytes  (int64 Unix nanoseconds LE)             │
 │   (slot always present even if NULL — null bitmap is authority) │
 ├────────────────────────────────────────────────────────────────┤
-│ Var directory  (4 bytes per variable-length column, in order)   │
-│   Offset uint16 LE  — byte offset from start of var-data region │
-│   Length uint16 LE  — byte length; both 0 if NULL              │
+│ Var directory  (12 bytes per variable-length column, in order)  │
+│   Inline value:   flag uint32=0 · Offset uint16 · Length uint16 · padding uint32 │
+│   Overflow value: flag uint32=1 · FirstOverflowPageID uint64    │
+│   (Offset=0 Length=0 if NULL; overflow flag set when value spills to overflow pages) │
 ├────────────────────────────────────────────────────────────────┤
 │ Var data  (VARCHAR / TEXT values, concatenated, no padding)     │
 └────────────────────────────────────────────────────────────────┘
-Total = ceil(N/8) + fixedSize + 4×numVarCols + Σ(varDataLengths)
+Total = ceil(N/8) + fixedSize + 12×numVarCols + Σ(varDataLengths)
 ```
 
 ### catalog.json format
@@ -567,8 +568,11 @@ The frontend provides a full database management UI: table browsing with paginat
 ### Build (backend only — no Node.js required)
 
 ```bash
+# From the project root (also builds all other Go binaries):
+make build
+# Or to build the backend binary alone:
 cd ui_admin && make backend && cd ..
-# Produces ./ui_admin/ui_admin_server
+# Both produce: ./ui_admin/ui_admin_server
 ```
 
 ### Build (full stack — requires Node.js)
@@ -660,11 +664,10 @@ An interactive end-to-end walkthrough using the daemon and the web admin UI.
 **Step 1 — Build all binaries:**
 
 ```bash
-make build                            # Go binaries (dbserver, dbctl, seeddb, …)
-cd ui_admin && make backend && cd ..  # REST API server (no Node.js required)
+make build    # builds all Go binaries including ui_admin_server (no Node.js required)
 ```
 
-> To also get the React UI, replace `make backend` with `make all` (requires Node.js 18+).
+> To also build the React UI, run `make build-all` (requires Node.js 18+).
 > Steps 2–4 (daemon + CLI) work with `make build` alone.
 
 **Step 2 — Seed the database with sample data:**
@@ -706,8 +709,22 @@ DB_DIR=/tmp/demo ./ui_admin/ui_admin_server
 
 **Step 6 — Open the browser:**
 
-Navigate to http://localhost:8080. The UI lets you browse tables, view and edit rows
-(with pagination), and create or drop tables.
+The REST API is now live at http://localhost:8080. You can query it directly:
+
+```bash
+curl http://localhost:8080/api/info
+curl -X POST http://localhost:8080/api/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SHOW TABLES"}'
+```
+
+For the full browser UI, open a second terminal and start the React dev server:
+
+```bash
+cd ui_admin/frontend && npm install && npm run dev
+```
+
+Then navigate to http://localhost:5173. The Vite dev server proxies `/api/*` to the backend on :8080.
 
 **Step 7 — Shut down:**
 
@@ -812,7 +829,9 @@ The `lexer` and `parser` packages tokenize SQL and build an AST.
 The `query` package (`planner` → `optimizer` → `physical operators`) translates that
 AST into storage operations. `query.Engine` ties it all together: one `Execute(sql)` call.
 
-**Supported statements**: `SELECT`, `INSERT INTO`, `CREATE TABLE`, `UPDATE`, `DELETE`
+**Supported statements**: `SELECT`, `INSERT INTO`, `CREATE TABLE`, `DROP TABLE`,
+`UPDATE`, `DELETE`, `CREATE DATABASE`, `DROP DATABASE`, `RENAME DATABASE`,
+`SHOW TABLES`, `SHOW DATABASES`
 
 ```bash
 # Usage: db_internals <database-dir> <sql>
@@ -822,11 +841,17 @@ AST into storage operations. `query.Engine` ties it all together: one `Execute(s
 ./db_internals /tmp/mydb "UPDATE users SET name = 'Bob' WHERE id = 1"
 ./db_internals /tmp/mydb "DELETE FROM users WHERE id = 1"
 ./db_internals /tmp/mydb "SELECT name, COUNT(*) FROM orders GROUP BY name"
+./db_internals /tmp/mydb "DROP TABLE users"
+./db_internals /tmp/mydb "SHOW TABLES"
+./db_internals /tmp/mydb "SHOW DATABASES"
+./db_internals /tmp/mydb "CREATE DATABASE mydb2"
+./db_internals /tmp/mydb "SELECT DISTINCT name FROM orders ORDER BY name DESC LIMIT 10"
 ```
 
+**SELECT clauses**: `WHERE`, `GROUP BY`, `ORDER BY [ASC|DESC]`, `DISTINCT`, `LIMIT`
 **WHERE operators**: `=  !=  <  >  <=  >=`
 **Logical operators**: `AND  OR`
-**Aggregate functions** (with `GROUP BY`): `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+**Aggregate functions** (with or without `GROUP BY`): `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
 
 ---
 

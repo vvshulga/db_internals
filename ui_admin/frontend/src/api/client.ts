@@ -2,6 +2,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8080/api';
 
 export interface InfoResponse {
   database_dir: string;
+  current_db: string;
   table_count: number;
   table_names: string[];
 }
@@ -101,6 +102,17 @@ export class ApiClient {
     return this.request('/query', {
       method: 'POST',
       body: JSON.stringify({ sql }),
+    });
+  }
+
+  async listDatabases(): Promise<string[]> {
+    return this.request('/databases');
+  }
+
+  async switchDatabase(name: string): Promise<{ success: boolean; message: string }> {
+    return this.request('/db/switch', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
     });
   }
 }

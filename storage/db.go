@@ -66,6 +66,15 @@ func OpenDB(dir string) (*DB, error) {
 	if err := db.loadCatalog(); err != nil {
 		return nil, fmt.Errorf("storage.OpenDB: %w", err)
 	}
+	// Ensure catalog.json exists on disk so that ListDatabases can discover
+	// this directory. Directories created before CreateDatabase wrote the file
+	// (or opened for the first time) get the marker written here.
+	catalogPath := filepath.Join(dir, catalogFileName)
+	if _, err := os.Stat(catalogPath); errors.Is(err, os.ErrNotExist) {
+		if writeErr := db.persistCatalog(); writeErr != nil {
+			return nil, fmt.Errorf("storage.OpenDB: write initial catalog: %w", writeErr)
+		}
+	}
 	return db, nil
 }
 
@@ -299,6 +308,11 @@ func CreateDatabase(parentDir, name string) error {
 	if err := os.MkdirAll(target, 0755); err != nil {
 		return fmt.Errorf("storage.CreateDatabase %q: %w", name, err)
 	}
+	// Write an empty catalog so ListDatabases can discover this directory immediately.
+	emptyPath := filepath.Join(target, catalogFileName)
+	if err := os.WriteFile(emptyPath, []byte(`{"tables":{}}`), 0644); err != nil {
+		return fmt.Errorf("storage.CreateDatabase %q writing catalog: %w", name, err)
+	}
 	return nil
 }
 
@@ -313,6 +327,27 @@ func DropDatabase(parentDir, name string) error {
 		return fmt.Errorf("storage.DropDatabase %q: %w", name, err)
 	}
 	return nil
+}
+
+// ListDatabases returns the names of all database directories inside parentDir.
+// A directory is considered a database if it contains a catalog.json file.
+func ListDatabases(parentDir string) ([]string, error) {
+	entries, err := os.ReadDir(parentDir)
+	if err != nil {
+		return nil, fmt.Errorf("storage.ListDatabases: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		catalogPath := filepath.Join(parentDir, e.Name(), catalogFileName)
+		if _, err := os.Stat(catalogPath); err == nil {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // RenameDatabase renames the database directory from filepath.Join(parentDir, oldName)
