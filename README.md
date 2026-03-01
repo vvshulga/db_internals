@@ -193,14 +193,14 @@ and auto-loaded on `OpenTable`.
 | **`Delete` overhead** | O(log n) | One heap fetch (to read old value) + one B-tree delete |
 | **Index open / rebuild** | O(n) | Flat-file replay on `OpenTable`; n = index entry count |
 
-**Benchmark comparison — 1 000-row table, `id INT` index (Intel i7-9750H):**
+**Benchmark — 1 000-row table, `id INT` index (Intel i7-9750H @ 2.60 GHz):**
 
 | Operation | Time/op | Allocs/op | Notes |
 |---|---|---|---|
-| Full-table scan (find by value) | 122 520 ns | 2 024 | Reads all pages, materialises all rows |
-| Index lookup (`LookupExact`) | 179 ns | 1 | **~684× faster** than full scan |
-| Index insert | 12 404 ns | 7 | Heap write + B-tree insert |
-| Range scan (~10% of rows) | 539 067 ns | 505 | 100-row range, 1 heap fetch per hit |
+| Full-table scan (find by value) | 119,170 ns | 2,024 | Reads all pages, materialises all rows |
+| Index lookup (`LookupExact`) | 181 ns | 1 | **~659× faster** than full scan |
+| Index insert | 10,305 ns | 7 | Heap write + B-tree insert |
+| Range scan (~10 % of rows) | 463,129 ns | 505 | 100-row range, 1 heap fetch per hit |
 
 #### Not optimized (without an index)
 
@@ -868,17 +868,98 @@ The project uses GitHub Actions to run the full test suite on every push (`.gith
 ### Benchmarks
 
 ```bash
+# Storage-layer benchmarks
 go test -bench=. -benchmem ./storage/...
+
+# SQL engine benchmarks
+go test -bench=. -benchmem ./query/...
 ```
 
-Results on Intel Core i7-9750H (darwin/amd64):
+All results below are from **Intel Core i7-9750H @ 2.60 GHz, darwin/amd64, 12 logical cores**.
+
+#### Storage layer — core operations
+
+| Benchmark | ns/op | µs/op | B/op | allocs/op |
+|---|---|---|---|---|
+| `Insert` (single row) | 8,040 | 8.0 | 19,757 | 7 |
+| `Get` (by RID) | 3,152 | 3.2 | 9,552 | 5 |
+| `Update` (delete + reinsert) | 24,404 | 24.4 | 50,234 | 12 |
+| `Delete` (tombstone) | 13,616 | 13.6 | 22,013 | 5 |
+
+#### Storage layer — full-table scan
+
+| Benchmark | ns/op | µs/op | B/op | allocs/op |
+|---|---|---|---|---|
+| `Scan/rows=10` | 4,365 | 4.4 | 11,544 | 29 |
+| `Scan/rows=100` | 13,493 | 13.5 | 28,584 | 212 |
+| `Scan/rows=1000` | 120,977 | 121 | 199,926 | 2,024 |
+
+#### Storage layer — B-tree index operations (1 000-row table, `id INT`)
+
+| Benchmark | ns/op | µs/op | B/op | allocs/op | Notes |
+|---|---|---|---|---|---|
+| `IndexInsert` | 10,305 | 10.3 | 19,893 | 7 | Heap write + B-tree insert |
+| `IndexLookup` | 181 | 0.18 | 16 | 1 | **~659× faster** than full scan |
+| `IndexRangeScan` (~10 % of rows) | 463,129 | 463 | 1,106,162 | 505 | 100-row range, 1 heap fetch per hit |
+
+#### Storage layer — index vs full scan comparison (1 000 rows)
+
+| Strategy | ns/op | µs/op | B/op | allocs/op |
+|---|---|---|---|---|
+| Full-table scan (find by value) | 119,170 | 119 | 199,927 | 2,024 |
+| Index point lookup | 206 | 0.21 | 16 | 1 |
+
+**Speedup: ~578× in favour of the index for point lookups.**
+
+#### Storage layer — TEXT overflow pages (single-row read/write)
+
+| Benchmark | Value size | ns/op | µs/op | B/op | allocs/op |
+|---|---|---|---|---|---|
+| `OverflowInsert/size=512` | 512 B (inline) | 8,734 | 8.7 | 19,551 | 7 |
+| `OverflowInsert/size=8161` | ~8 KiB (1 overflow page) | 51,004 | 51 | 61,404 | 18 |
+| `OverflowInsert/size=65288` | ~64 KiB (~8 pages) | 160,426 | 160 | 242,823 | 54 |
+| `OverflowInsert/size=261152` | ~255 KiB (~32 pages) | 483,875 | 484 | 864,752 | 174 |
+| `OverflowGet/size=512` | 512 B (inline) | 3,231 | 3.2 | 10,632 | 6 |
+| `OverflowGet/size=8161` | ~8 KiB | 16,139 | 16.1 | 61,272 | 14 |
+| `OverflowGet/size=65288` | ~64 KiB | 101,433 | 101 | 423,372 | 70 |
+| `OverflowGet/size=261152` | ~255 KiB | 386,362 | 386 | 1,666,974 | 269 |
+
+#### Storage layer — page compaction (zero allocations)
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---|---|---|
-| `BenchmarkInsert` | 10,785 | 36,956 | 7 |
-| `BenchmarkGet` | 4,146 | 17,744 | 5 |
-| `BenchmarkUpdate` | 24,855 | 82,937 | 12 |
-| `BenchmarkDelete` | 14,102 | 38,373 | 5 |
-| `BenchmarkScan/rows=10` | 6,221 | 19,732 | 29 |
-| `BenchmarkScan/rows=100` | 16,675 | 36,773 | 212 |
-| `BenchmarkScan/rows=1000` | 170,811 | 214,951 | 2,021 |
+| `Compact/tuples=10` | 367 | 0 | 0 |
+| `Compact/tuples=100` | 1,416 | 0 | 0 |
+| `Compact/tuples=1000` | 9,035 | 0 | 0 |
+
+Compaction repacks all live tuples in a single pass, allocating nothing extra. It fires lazily on the next insert into a full page.
+
+#### SQL engine — end-to-end query latency (parse → plan → optimize → execute)
+
+All queries go through the full `Engine.Execute(sql)` pipeline.
+
+| Benchmark | ns/op | µs/op | B/op | allocs/op | Notes |
+|---|---|---|---|---|---|
+| `SQL_Insert` | 13,258 | 13.3 | 21,047 | 48 | Full pipeline, 1 row |
+| `SQL_Select_FullScan/rows=10` | 8,523 | 8.5 | 14,624 | 70 | |
+| `SQL_Select_FullScan/rows=100` | 27,329 | 27.3 | 50,392 | 346 | |
+| `SQL_Select_FullScan/rows=1000` | 232,266 | 232 | 402,044 | 3,064 | |
+| `SQL_Select_Filter/rows=100` | 31,692 | 31.7 | 33,840 | 252 | `WHERE id = N` (full scan + filter) |
+| `SQL_Select_Filter/rows=1000` | 171,646 | 172 | 247,251 | 2,067 | |
+| `SQL_Select_IndexLookup` | 8,637 | 8.6 | 12,264 | 44 | 1 000-row table, index on `id` |
+| `SQL_Select_Aggregate/rows=100` | 41,258 | 41.3 | 40,632 | 414 | `COUNT(*) GROUP BY id` |
+| `SQL_Select_Aggregate/rows=1000` | 285,050 | 285 | 261,373 | 3,129 | |
+| `SQL_Select_OrderByLimit/rows=100` | 34,191 | 34.2 | 52,384 | 374 | `ORDER BY score DESC LIMIT 10` |
+| `SQL_Select_OrderByLimit/rows=1000` | 259,315 | 259 | 404,035 | 3,092 | |
+| `SQL_Update` | 1,429,100 | 1,429 | 321,167 | 20,497 | Full scan of 100 rows, delete + reinsert per match |
+
+**SQL engine overhead** (parse + plan + optimize + operator Open/Close) is approximately **5–9 µs per query**, independent of row count. The dominant cost for large result sets is always the storage scan.
+
+**Index vs full scan via SQL** (1 000-row table, `WHERE id = 500`):
+
+| Strategy | ns/op | µs/op |
+|---|---|---|
+| Full scan + filter | 171,646 | 172 |
+| Index point lookup | 8,637 | 8.6 |
+
+**Speedup: ~20× at the SQL layer** (the remaining gap versus the raw 578× storage-layer advantage is parse/plan/optimize + operator pipeline overhead).
