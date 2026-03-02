@@ -1125,6 +1125,49 @@ func (op *PhysicalDropTable) Schema() *storage.Schema {
 	return s
 }
 
+// ---- PhysicalCreateIndex -----------------------------------------------------
+
+type PhysicalCreateIndex struct {
+	db         *storage.DB
+	tableName  string
+	columnName string
+	unique     bool
+	done       bool
+}
+
+func NewPhysicalCreateIndex(db *storage.DB, tableName, columnName string, unique bool) *PhysicalCreateIndex {
+	return &PhysicalCreateIndex{db: db, tableName: tableName, columnName: columnName, unique: unique}
+}
+
+func (op *PhysicalCreateIndex) Open() error {
+	tbl, err := op.db.OpenTable(op.tableName)
+	if err != nil {
+		return err
+	}
+	op.done = false
+	return tbl.CreateIndex(op.columnName, op.unique)
+}
+
+func (op *PhysicalCreateIndex) Next() (storage.Row, error) {
+	if op.done {
+		return nil, io.EOF
+	}
+	op.done = true
+	kind := "Index"
+	if op.unique {
+		kind = "Unique index"
+	}
+	msg := fmt.Sprintf("%s on '%s.%s' created", kind, op.tableName, op.columnName)
+	return storage.Row{storage.NewVarcharValue(msg)}, nil
+}
+
+func (op *PhysicalCreateIndex) Close() error { return nil }
+
+func (op *PhysicalCreateIndex) Schema() *storage.Schema {
+	s, _ := storage.NewSchema([]storage.Column{{Name: "message", Type: storage.TypeVARCHAR, MaxLen: 255}})
+	return s
+}
+
 // ---- PhysicalCreateDatabase --------------------------------------------------
 
 type PhysicalCreateDatabase struct {

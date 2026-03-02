@@ -16,6 +16,8 @@ export interface Column {
   name: string;
   type: string;
   nullable: boolean;
+  indexed?: boolean;
+  index_unique?: boolean;
 }
 
 export interface RowData {
@@ -103,6 +105,17 @@ export class ApiClient {
       method: 'POST',
       body: JSON.stringify({ sql }),
     });
+  }
+
+  async createIndex(table: string, column: string, unique: boolean): Promise<{ success: boolean; message: string }> {
+    return this.request(`/tables/${table}/indexes`, {
+      method: 'POST',
+      body: JSON.stringify({ column, unique }),
+    });
+  }
+
+  async dropIndex(table: string, column: string): Promise<{ success: boolean; message: string }> {
+    return this.request(`/tables/${table}/indexes/${column}`, { method: 'DELETE' });
   }
 
   async listDatabases(): Promise<string[]> {

@@ -10,7 +10,7 @@ import (
 	"github.com/vvshulga/db_internals/storage"
 )
 
-// SchemaToJSON converts storage.Schema to JSON-friendly TableSchema
+// SchemaToJSON converts storage.Schema to JSON-friendly TableSchema (no index info).
 func SchemaToJSON(name string, schema *storage.Schema) TableSchema {
 	cols := make([]Column, schema.NumColumns())
 	for i := 0; i < schema.NumColumns(); i++ {
@@ -20,6 +20,36 @@ func SchemaToJSON(name string, schema *storage.Schema) TableSchema {
 			Type:     formatColumnType(c),
 			Nullable: c.Nullable,
 		}
+	}
+	return TableSchema{Name: name, Columns: cols}
+}
+
+// SchemaToJSONWithIndexes converts a TableHandle schema to TableSchema,
+// populating Indexed and IndexUnique for every column that has an index.
+func SchemaToJSONWithIndexes(tbl *storage.TableHandle) TableSchema {
+	schema := tbl.Schema()
+	name := tbl.Name()
+
+	// Build a fast lookup: colName → IndexMeta
+	infos := tbl.IndexInfos()
+	idxMap := make(map[string]storage.IndexMeta, len(infos))
+	for _, m := range infos {
+		idxMap[m.Column] = m
+	}
+
+	cols := make([]Column, schema.NumColumns())
+	for i := 0; i < schema.NumColumns(); i++ {
+		c := schema.Column(i)
+		col := Column{
+			Name:     c.Name,
+			Type:     formatColumnType(c),
+			Nullable: c.Nullable,
+		}
+		if m, ok := idxMap[c.Name]; ok {
+			col.Indexed = true
+			col.IndexUnique = m.Unique
+		}
+		cols[i] = col
 	}
 	return TableSchema{Name: name, Columns: cols}
 }

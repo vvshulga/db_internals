@@ -121,6 +121,21 @@ func (d *LogicalDropTable) String() string {
 	return fmt.Sprintf("DropTable(%s)", d.TableName)
 }
 
+// LogicalCreateIndex represents a CREATE [UNIQUE] INDEX ON table (column) statement.
+type LogicalCreateIndex struct {
+	TableName  string
+	ColumnName string
+	Unique     bool
+}
+
+func (c *LogicalCreateIndex) Schema() *storage.Schema { return nil }
+func (c *LogicalCreateIndex) String() string {
+	if c.Unique {
+		return fmt.Sprintf("CreateUniqueIndex(%s.%s)", c.TableName, c.ColumnName)
+	}
+	return fmt.Sprintf("CreateIndex(%s.%s)", c.TableName, c.ColumnName)
+}
+
 // LogicalCreateDatabase represents a CREATE DATABASE statement.
 type LogicalCreateDatabase struct {
 	DBName string

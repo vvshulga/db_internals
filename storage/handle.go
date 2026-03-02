@@ -209,6 +209,30 @@ func (t *TableHandle) HasIndex(colName string) bool {
 	return ok
 }
 
+// IndexMeta describes a single column index.
+type IndexMeta struct {
+	Column string
+	Unique bool
+}
+
+// IndexInfos returns metadata for every index currently open on this table,
+// sorted alphabetically by column name.
+func (t *TableHandle) IndexInfos() []IndexMeta {
+	if len(t.indexes) == 0 {
+		return nil
+	}
+	out := make([]IndexMeta, 0, len(t.indexes))
+	for col, idx := range t.indexes {
+		out = append(out, IndexMeta{Column: col, Unique: idx.IsUnique()})
+	}
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].Column < out[j-1].Column; j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
+}
+
 // LookupExact returns all RIDs whose value for colName equals val.
 // Returns ErrIndexNotFound if no index exists for that column.
 func (t *TableHandle) LookupExact(colName string, val Value) ([]RID, error) {

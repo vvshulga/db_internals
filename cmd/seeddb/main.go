@@ -81,6 +81,8 @@ func executeStmt(db *storage.DB, stmt parser.AstNode) error {
 		return executeCreateTable(db, s)
 	case *parser.InsertStmt:
 		return executeInsert(db, s)
+	case *parser.CreateIndexStmt:
+		return executeCreateIndex(db, s)
 	case *parser.SelectStmt:
 		return fmt.Errorf("SELECT not supported in seeddb (read-only tool)")
 	case *parser.UpdateStmt:
@@ -158,6 +160,19 @@ func parseColumnDef(cd parser.ColumnDef) (storage.Column, error) {
 		MaxLen:   maxLen,
 		Nullable: cd.Nullable,
 	}, nil
+}
+
+// executeCreateIndex creates an index on a table column.
+func executeCreateIndex(db *storage.DB, stmt *parser.CreateIndexStmt) error {
+	tbl, err := db.OpenTable(stmt.TableName)
+	if err != nil {
+		return fmt.Errorf("open table %q: %w", stmt.TableName, err)
+	}
+	if err := tbl.CreateIndex(stmt.ColumnName, stmt.Unique); err != nil {
+		return fmt.Errorf("create index on %s.%s: %w", stmt.TableName, stmt.ColumnName, err)
+	}
+	log.Printf("Created index on %s.%s (unique=%v)", stmt.TableName, stmt.ColumnName, stmt.Unique)
+	return nil
 }
 
 // executeInsert executes an INSERT statement

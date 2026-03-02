@@ -106,6 +106,9 @@ type Index struct {
 	dirty    bool
 }
 
+// IsUnique reports whether this index enforces uniqueness.
+func (idx *Index) IsUnique() bool { return idx.unique }
+
 // indexPath returns the canonical path for this index file.
 func (idx *Index) indexPath() string {
 	return filepath.Join(idx.dir, idx.basename+".idx")

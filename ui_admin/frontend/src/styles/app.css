@@ -333,6 +333,45 @@ button.danger:disabled:hover {
   background: #e74c3c;
 }
 
+/* Index badges */
+.badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.badge-unique {
+  background: #d4edda;
+  color: #155724;
+}
+
+.badge-index {
+  background: #cce5ff;
+  color: #004085;
+}
+
+.badge-none {
+  color: #aaa;
+}
+
+.index-actions {
+  white-space: nowrap;
+}
+
+button.small {
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  margin-right: 4px;
+}
+
+.muted {
+  color: #999;
+  font-size: 0.85rem;
+}
+
 /* SQL Console */
 .sql-textarea {
   width: 100%;

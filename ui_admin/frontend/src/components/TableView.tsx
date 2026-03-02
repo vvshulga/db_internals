@@ -104,7 +104,7 @@ export default function TableView() {
         <button className="secondary">Back to Tables</button>
       </Link>
 
-      <SchemaView schema={schema} />
+      <SchemaView schema={schema} onRefresh={loadData} />
 
       <h3>Rows</h3>
 

@@ -16,9 +16,17 @@ type TableSchema struct {
 
 // Column represents a single column in a table schema
 type Column struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"`      // "INT", "VARCHAR(64)", etc.
-	Nullable bool   `json:"nullable"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`         // "INT", "VARCHAR(64)", etc.
+	Nullable    bool   `json:"nullable"`
+	Indexed     bool   `json:"indexed"`      // true if a B-tree index exists for this column
+	IndexUnique bool   `json:"index_unique"` // true if the index enforces uniqueness
+}
+
+// CreateIndexRequest is the payload for POST /api/tables/{name}/indexes
+type CreateIndexRequest struct {
+	Column string `json:"column"`
+	Unique bool   `json:"unique"`
 }
 
 // RowsResponse returns paginated row data

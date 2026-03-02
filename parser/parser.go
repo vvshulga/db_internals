@@ -107,6 +107,13 @@ type ShowDatabasesStmt struct{}
 // UseDatabaseStmt: USE [DATABASE] <name>
 type UseDatabaseStmt struct{ DBName string }
 
+// CreateIndexStmt: CREATE [UNIQUE] INDEX ON <table> (<column>)
+type CreateIndexStmt struct {
+	TableName  string
+	ColumnName string
+	Unique     bool
+}
+
 // Expr represents expressions in WHERE clauses and VALUES
 type Expr interface{}
 
@@ -598,16 +605,57 @@ func (p *parser) parseCreate() (AstNode, error) {
 	p.next() // consume CREATE
 	t := p.peek()
 	if t == nil {
-		return nil, fmt.Errorf("expected TABLE or DATABASE after CREATE, got eof")
+		return nil, fmt.Errorf("expected TABLE, DATABASE, INDEX, or UNIQUE after CREATE, got eof")
 	}
 	switch strings.ToUpper(t.Value) {
 	case "TABLE":
 		return p.parseCreateTableBody()
 	case "DATABASE":
 		return p.parseCreateDatabaseBody()
+	case "INDEX":
+		return p.parseCreateIndexBody(false)
+	case "UNIQUE":
+		p.next() // consume UNIQUE
+		return p.parseCreateIndexBody(true)
 	default:
-		return nil, fmt.Errorf("expected TABLE or DATABASE after CREATE, got %s", t.Value)
+		return nil, fmt.Errorf("expected TABLE, DATABASE, INDEX, or UNIQUE after CREATE, got %s", t.Value)
 	}
+}
+
+// parseCreateIndexBody parses: [UNIQUE] INDEX ON <table> (<column>)
+// (CREATE and optional UNIQUE already consumed)
+func (p *parser) parseCreateIndexBody(unique bool) (AstNode, error) {
+	if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	t := p.peek()
+	if t == nil || t.Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected table name after CREATE INDEX ON")
+	}
+	tableName := p.next().Value
+
+	// expect opening paren
+	if p.peek() == nil || p.peek().Value != "(" {
+		return nil, fmt.Errorf("expected '(' after table name in CREATE INDEX")
+	}
+	p.next() // consume '('
+
+	col := p.peek()
+	if col == nil || col.Type != lexer.TokenIdentifier {
+		return nil, fmt.Errorf("expected column name in CREATE INDEX")
+	}
+	colName := p.next().Value
+
+	// expect closing paren
+	if p.peek() == nil || p.peek().Value != ")" {
+		return nil, fmt.Errorf("expected ')' after column name in CREATE INDEX")
+	}
+	p.next() // consume ')'
+
+	return &CreateIndexStmt{TableName: tableName, ColumnName: colName, Unique: unique}, nil
 }
 
 // parseCreateDatabaseBody parses: CREATE DATABASE <name>  (CREATE already consumed)

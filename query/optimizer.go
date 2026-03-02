@@ -54,9 +54,15 @@ func (o *Optimizer) Optimize(plan LogicalPlan) (PhysicalOperator, error) {
 		return NewPhysicalShowTables(o.db), nil
 	case *LogicalShowDatabases:
 		return NewPhysicalShowDatabases(o.db), nil
+	case *LogicalCreateIndex:
+		return o.optimizeCreateIndex(p)
 	default:
 		return nil, fmt.Errorf("unsupported logical plan type %T", plan)
 	}
+}
+
+func (o *Optimizer) optimizeCreateIndex(ci *LogicalCreateIndex) (PhysicalOperator, error) {
+	return NewPhysicalCreateIndex(o.db, ci.TableName, ci.ColumnName, ci.Unique), nil
 }
 
 // optimizeScan converts a logical scan to a physical table scan.

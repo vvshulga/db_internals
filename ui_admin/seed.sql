@@ -8086,3 +8086,20 @@ INSERT INTO order_items VALUES (2997, 673, 975, 4, 4054)
 INSERT INTO order_items VALUES (2998, 934, 770, 2, 5401)
 INSERT INTO order_items VALUES (2999, 363, 628, 4, 1084)
 INSERT INTO order_items VALUES (3000, 896, 41, 4, 7203)
+
+-- ============================================================================
+-- Indexes
+-- Created after data load for efficiency (one B-tree build vs N insertions).
+-- ============================================================================
+
+-- products: fast lookup by id and by category
+CREATE INDEX ON products (id)
+CREATE INDEX ON products (category_id)
+
+-- orders: fast lookup by id and by user
+CREATE INDEX ON orders (id)
+CREATE INDEX ON orders (user_id)
+
+-- order_items: fast lookup by order and by product (the two common join keys)
+CREATE INDEX ON order_items (order_id)
+CREATE INDEX ON order_items (product_id)

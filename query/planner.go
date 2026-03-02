@@ -42,9 +42,19 @@ func (p *Planner) Plan(stmt parser.AstNode) (LogicalPlan, error) {
 		return &LogicalShowTables{}, nil
 	case *parser.ShowDatabasesStmt:
 		return &LogicalShowDatabases{}, nil
+	case *parser.CreateIndexStmt:
+		return p.planCreateIndex(s)
 	default:
 		return nil, fmt.Errorf("unsupported statement type %T", stmt)
 	}
+}
+
+func (p *Planner) planCreateIndex(stmt *parser.CreateIndexStmt) (LogicalPlan, error) {
+	return &LogicalCreateIndex{
+		TableName:  stmt.TableName,
+		ColumnName: stmt.ColumnName,
+		Unique:     stmt.Unique,
+	}, nil
 }
 
 // planSelect converts a SELECT statement to a logical plan.

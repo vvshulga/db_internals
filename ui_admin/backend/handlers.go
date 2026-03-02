@@ -232,6 +232,28 @@ func (s *Server) handleTableOps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(pathParts) >= 2 && pathParts[1] == "indexes" {
+		// /api/tables/{name}/indexes          POST → create index
+		// /api/tables/{name}/indexes/{column} DELETE → drop index
+		if len(pathParts) == 2 {
+			if r.Method == "POST" {
+				s.handleCreateIndex(w, r, tableName)
+			} else {
+				respondError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			}
+			return
+		}
+		if len(pathParts) == 3 {
+			colName := pathParts[2]
+			if r.Method == "DELETE" {
+				s.handleDropIndex(w, r, tableName, colName)
+			} else {
+				respondError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			}
+			return
+		}
+	}
+
 	if len(pathParts) >= 2 && pathParts[1] == "rows" {
 		// /api/tables/{name}/rows[/{rid}]
 		if len(pathParts) == 2 {
@@ -267,7 +289,7 @@ func (s *Server) handleTableOps(w http.ResponseWriter, r *http.Request) {
 	respondError(w, http.StatusNotFound, "Endpoint not found")
 }
 
-// handleGetTableSchema returns table schema
+// handleGetTableSchema returns table schema including index metadata.
 func (s *Server) handleGetTableSchema(w http.ResponseWriter, r *http.Request, tableName string) {
 	table, err := s.db.OpenTable(tableName)
 	if err != nil {
@@ -280,8 +302,7 @@ func (s *Server) handleGetTableSchema(w http.ResponseWriter, r *http.Request, ta
 		return
 	}
 
-	schema := SchemaToJSON(tableName, table.Schema())
-	respondJSON(w, http.StatusOK, schema)
+	respondJSON(w, http.StatusOK, SchemaToJSONWithIndexes(table))
 }
 
 // handleDropTable deletes a table
@@ -299,6 +320,73 @@ func (s *Server) handleDropTable(w http.ResponseWriter, r *http.Request, tableNa
 	respondJSON(w, http.StatusOK, SuccessResponse{
 		Success: true,
 		Message: fmt.Sprintf("Table %q dropped", tableName),
+	})
+}
+
+// handleCreateIndex creates a B-tree index on a column: POST /api/tables/{name}/indexes
+func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request, tableName string) {
+	var req CreateIndexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
+		return
+	}
+	if req.Column == "" {
+		respondError(w, http.StatusBadRequest, "column is required")
+		return
+	}
+	tbl, err := s.db.OpenTable(tableName)
+	if err != nil {
+		var notFound *storage.ErrTableNotFound
+		if errors.As(err, &notFound) {
+			respondError(w, http.StatusNotFound, fmt.Sprintf("Table %q not found", tableName))
+			return
+		}
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to open table: %v", err))
+		return
+	}
+	if err := tbl.CreateIndex(req.Column, req.Unique); err != nil {
+		var idxExists *storage.ErrIndexExists
+		if errors.As(err, &idxExists) {
+			respondError(w, http.StatusConflict, fmt.Sprintf("Index on %q already exists", req.Column))
+			return
+		}
+		respondError(w, http.StatusBadRequest, fmt.Sprintf("Failed to create index: %v", err))
+		return
+	}
+	kind := "Index"
+	if req.Unique {
+		kind = "Unique index"
+	}
+	respondJSON(w, http.StatusCreated, SuccessResponse{
+		Success: true,
+		Message: fmt.Sprintf("%s on column %q created", kind, req.Column),
+	})
+}
+
+// handleDropIndex removes a column index: DELETE /api/tables/{name}/indexes/{column}
+func (s *Server) handleDropIndex(w http.ResponseWriter, r *http.Request, tableName, colName string) {
+	tbl, err := s.db.OpenTable(tableName)
+	if err != nil {
+		var notFound *storage.ErrTableNotFound
+		if errors.As(err, &notFound) {
+			respondError(w, http.StatusNotFound, fmt.Sprintf("Table %q not found", tableName))
+			return
+		}
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to open table: %v", err))
+		return
+	}
+	if err := tbl.DropIndex(colName); err != nil {
+		var idxNotFound *storage.ErrIndexNotFound
+		if errors.As(err, &idxNotFound) {
+			respondError(w, http.StatusNotFound, fmt.Sprintf("No index on column %q", colName))
+			return
+		}
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to drop index: %v", err))
+		return
+	}
+	respondJSON(w, http.StatusOK, SuccessResponse{
+		Success: true,
+		Message: fmt.Sprintf("Index on column %q dropped", colName),
 	})
 }
 
