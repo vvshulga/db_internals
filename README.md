@@ -17,6 +17,7 @@ Education project for the DB Internals CS osvita course. Implements an OLTP row-
 - [Demo](#demo)
 - [Running and Recovery](#running-and-recovery)
 - [SQL Frontend](#sql-frontend)
+  - [Parser](#parser)
 - [Testing](#testing)
 
 ---
@@ -828,6 +829,31 @@ that is already validated on every `Unmarshal`, so corrupt pages are detected at
 The `lexer` and `parser` packages tokenize SQL and build an AST.
 The `query` package (`planner` → `optimizer` → `physical operators`) translates that
 AST into storage operations. `query.Engine` ties it all together: one `Execute(sql)` call.
+
+### Parser
+
+The parser is a **hand-written recursive-descent (LL(1)) parser**. Each grammar rule
+maps directly to a Go method that calls other methods for sub-rules:
+
+```
+parseStatements()
+  └─ parseStatement()         ← dispatches on first keyword
+       ├─ parseSelect()
+       │    ├─ parseLogical()      ← WHERE clause (AND / OR)
+       │    │    └─ parseComparison()   ← col op value
+       │    └─ …GROUP BY, ORDER BY, LIMIT
+       ├─ parseInsert()
+       ├─ parseUpdate()
+       └─ … (one method per statement type)
+```
+
+| Property | Detail |
+|---|---|
+| Type | Recursive-descent (top-down) |
+| Generator | None — hand-written in Go |
+| Lookahead | LL(1): `peek()` reads one token, `next()` consumes it |
+| Expression precedence | Two-level: `parseLogical()` → `parseComparison()` |
+| Error handling | Returns on first unexpected token (no error recovery) |
 
 **Supported statements**: `SELECT`, `INSERT INTO`, `CREATE TABLE`, `DROP TABLE`,
 `UPDATE`, `DELETE`, `CREATE DATABASE`, `DROP DATABASE`, `RENAME DATABASE`,
