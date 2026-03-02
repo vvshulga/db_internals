@@ -37,6 +37,9 @@ func (e *Evaluator) Eval(expr parser.Expr, row storage.Row) (storage.Value, erro
 		}
 		return storage.NewBigIntValue(int64(ex.Value)), nil
 
+	case *parser.LiteralFloat:
+		return storage.NewDoubleValue(ex.Value), nil
+
 	case *parser.LiteralString:
 		return storage.NewVarcharValue(ex.Value), nil
 
@@ -67,12 +70,69 @@ func (e *Evaluator) Eval(expr parser.Expr, row storage.Row) (storage.Value, erro
 	}
 }
 
+// promoteNumeric widens a numeric value to the target kind.
+// Used for cross-type comparisons like INT vs DOUBLE.
+func promoteNumeric(v storage.Value, target storage.ValueKind) storage.Value {
+	switch target {
+	case storage.KindBigInt:
+		if v.Kind() == storage.KindInt {
+			return storage.NewBigIntValue(int64(v.AsInt()))
+		}
+	case storage.KindFloat:
+		switch v.Kind() {
+		case storage.KindInt:
+			return storage.NewFloatValue(float32(v.AsInt()))
+		case storage.KindBigInt:
+			return storage.NewFloatValue(float32(v.AsBigInt()))
+		}
+	case storage.KindDouble:
+		switch v.Kind() {
+		case storage.KindInt:
+			return storage.NewDoubleValue(float64(v.AsInt()))
+		case storage.KindBigInt:
+			return storage.NewDoubleValue(float64(v.AsBigInt()))
+		case storage.KindFloat:
+			return storage.NewDoubleValue(float64(v.AsFloat()))
+		}
+	}
+	return v
+}
+
+// numericRank returns a promotion rank for numeric kinds (higher = wider).
+// Returns -1 for non-numeric kinds.
+func numericRank(k storage.ValueKind) int {
+	switch k {
+	case storage.KindInt:
+		return 0
+	case storage.KindBigInt:
+		return 1
+	case storage.KindFloat:
+		return 2
+	case storage.KindDouble:
+		return 3
+	}
+	return -1
+}
+
 // evalComparison evaluates a comparison operator on two values.
 // Implements SQL NULL semantics: NULL compared to anything is NULL.
 func (e *Evaluator) evalComparison(op string, left, right storage.Value) (storage.Value, error) {
 	// SQL NULL semantics: NULL compared to anything is NULL
 	if left.IsNull() || right.IsNull() {
 		return storage.NewNullValue(), nil
+	}
+
+	// Numeric promotion: widen both sides to the wider numeric type so that
+	// e.g. DOUBLE column vs INT literal works without an explicit CAST.
+	if left.Kind() != right.Kind() {
+		lr, rr := numericRank(left.Kind()), numericRank(right.Kind())
+		if lr >= 0 && rr >= 0 {
+			if lr > rr {
+				right = promoteNumeric(right, left.Kind())
+			} else {
+				left = promoteNumeric(left, right.Kind())
+			}
+		}
 	}
 
 	// Type checking

@@ -125,6 +125,10 @@ type LiteralInt struct {
 	Value uint64
 }
 
+type LiteralFloat struct {
+	Value float64
+}
+
 type LiteralString struct {
 	Value string
 }
@@ -499,7 +503,11 @@ func (p *parser) parseComparison() (Expr, error) {
 	case lexer.TokenNumber:
 		v := p.next().Value
 		if strings.Contains(v, ".") {
-			v = strings.SplitN(v, ".", 2)[0]
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return nil, err
+			}
+			return &ComparisonOp{Left: left, Op: op, Right: &LiteralFloat{Value: f}}, nil
 		}
 		u, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
@@ -567,13 +575,18 @@ func (p *parser) parseInsert() (AstNode, error) {
 		if p.peek().Type == lexer.TokenNumber {
 			v := p.next().Value
 			if strings.Contains(v, ".") {
-				v = strings.SplitN(v, ".", 2)[0]
+				f, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					return nil, err
+				}
+				vals = append(vals, &LiteralFloat{Value: f})
+			} else {
+				u, err := strconv.ParseUint(v, 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				vals = append(vals, &LiteralInt{Value: u})
 			}
-			u, err := strconv.ParseUint(v, 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			vals = append(vals, &LiteralInt{Value: u})
 			hasValues = true
 		} else if p.peek().Type == lexer.TokenString {
 			s := p.next().Value
@@ -907,13 +920,18 @@ func (p *parser) parseUpdate() (AstNode, error) {
 		case lexer.TokenNumber:
 			v := p.next().Value
 			if strings.Contains(v, ".") {
-				v = strings.SplitN(v, ".", 2)[0]
+				f, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					return nil, err
+				}
+				valueExpr = &LiteralFloat{Value: f}
+			} else {
+				u, err := strconv.ParseUint(v, 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				valueExpr = &LiteralInt{Value: u}
 			}
-			u, err := strconv.ParseUint(v, 10, 64)
-			if err != nil {
-				return nil, err
-			}
-			valueExpr = &LiteralInt{Value: u}
 		case lexer.TokenString:
 			valueExpr = &LiteralString{Value: p.next().Value}
 		case lexer.TokenIdentifier:
@@ -1139,6 +1157,8 @@ func formatExprInline(e Expr) string {
 		return "col:" + x.Name
 	case *LiteralInt:
 		return fmt.Sprintf("int:%d", x.Value)
+	case *LiteralFloat:
+		return fmt.Sprintf("float:%g", x.Value)
 	case *LiteralString:
 		return "str:'" + x.Value + "'"
 	case *ComparisonOp:
@@ -1158,6 +1178,8 @@ func formatExpr(e Expr, indent string) string {
 		return indent + "Column: " + x.Name
 	case *LiteralInt:
 		return fmt.Sprintf(indent+"Integer: %d", x.Value)
+	case *LiteralFloat:
+		return fmt.Sprintf(indent+"Float: %g", x.Value)
 	case *LiteralString:
 		return indent + "String: '" + x.Value + "'"
 	case *ComparisonOp:

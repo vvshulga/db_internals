@@ -355,7 +355,7 @@ func (p *Planner) validateExpr(expr parser.Expr, schema *storage.Schema) error {
 		if err := p.validateExpr(e.Right, schema); err != nil {
 			return err
 		}
-	case *parser.LiteralInt, *parser.LiteralString:
+	case *parser.LiteralInt, *parser.LiteralFloat, *parser.LiteralString:
 		// Always valid
 	default:
 		return fmt.Errorf("unsupported expression type %T", e)

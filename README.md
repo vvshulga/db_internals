@@ -18,6 +18,9 @@ Education project for the DB Internals CS osvita course. Implements an OLTP row-
 - [Running and Recovery](#running-and-recovery)
 - [SQL Frontend](#sql-frontend)
   - [Parser](#parser)
+  - [Logical Plan](#logical-plan)
+  - [Physical Plan and the Volcano Iterator Model](#physical-plan-and-the-volcano-iterator-model)
+  - [Logical → Physical Transformation](#logical--physical-transformation)
 - [Testing](#testing)
 
 ---
@@ -878,6 +881,126 @@ parseStatements()
 **WHERE operators**: `=  !=  <  >  <=  >=`
 **Logical operators**: `AND  OR`
 **Aggregate functions** (with or without `GROUP BY`): `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+
+### Logical Plan
+
+The **Planner** ([query/planner.go](query/planner.go)) converts the AST into a tree of `LogicalPlan` nodes. Each node describes *what* to compute, independent of storage implementation — no index checks, no physical decisions.
+
+**Example**: `SELECT * FROM products WHERE price > 50.5 ORDER BY price DESC LIMIT 5`
+
+```
+LogicalLimit(5)
+  └─ LogicalSort([price DESC])
+       └─ LogicalProjection([*])
+            └─ LogicalFilter(price > 50.5)
+                 └─ LogicalScan(products)
+```
+
+The planner builds this bottom-up for `SELECT`: scan → filter → project → (aggregate) → (distinct) → sort → limit. It also validates: table exists, all column references are present in the schema, sort keys are in scope. At this stage there are no storage handles and no index checks — just a pure description of the query.
+
+**All logical node types** (defined in [query/logical.go](query/logical.go)):
+
+| Node | Represents |
+|---|---|
+| `LogicalScan` | Full table scan |
+| `LogicalFilter` | `WHERE` predicate |
+| `LogicalProjection` | `SELECT` column list |
+| `LogicalAggregate` | `GROUP BY` + aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) |
+| `LogicalSort` | `ORDER BY` |
+| `LogicalDistinct` | `SELECT DISTINCT` |
+| `LogicalLimit` | `LIMIT` |
+| `LogicalInsert` | `INSERT INTO` |
+| `LogicalUpdate` | `UPDATE … SET … WHERE` |
+| `LogicalDelete` | `DELETE FROM … WHERE` |
+| `LogicalCreateTable` / `LogicalDropTable` | DDL |
+| `LogicalCreateIndex` | `CREATE [UNIQUE] INDEX ON` |
+| `LogicalCreateDatabase` / `LogicalDropDatabase` / `LogicalRenameDatabase` | Database-level DDL |
+| `LogicalShowTables` / `LogicalShowDatabases` | `SHOW` statements |
+
+Every node implements `Schema() *storage.Schema` (the output column set it produces) and `String()` (human-readable for debugging).
+
+---
+
+### Physical Plan and the Volcano Iterator Model
+
+The **Optimizer** ([query/optimizer.go](query/optimizer.go)) converts the logical tree into physical operators — deciding *how* to implement each logical node. Every physical operator implements the **Volcano iterator interface** ([query/physical.go:16](query/physical.go#L16)):
+
+```go
+type PhysicalOperator interface {
+    Open() error                   // allocate state, run index lookups
+    Next() (storage.Row, error)    // pull one row; returns io.EOF when done
+    Close() error                  // release resources
+    Schema() *storage.Schema       // output schema
+}
+```
+
+Execution is **pull-based**: the engine calls `Open()` on the root, then loops `Next()` until `io.EOF`. Each operator pulls rows from its child on demand.
+
+**Physical operators and their behaviour:**
+
+| Operator | `Open()` | `Next()` | Strategy |
+|---|---|---|---|
+| `PhysicalTableScan` | starts a `storage.Scanner` | returns rows one by one | streaming |
+| `PhysicalIndexScan` | calls `LookupExact` or `RangeScan` → collects RIDs | fetches rows by RID one by one | streaming |
+| `PhysicalFilter` | calls `input.Open()` | pulls rows, skips those where predicate is false/NULL | streaming |
+| `PhysicalProjection` | calls `input.Open()` | evaluates column expressions per row | streaming |
+| `PhysicalLimit` | calls `input.Open()`, resets counter | returns rows until `count >= limit` | streaming |
+| `PhysicalInsert` | inserts the row into the heap | returns the inserted page ID | one-shot |
+| `PhysicalUpdate` | consumes all input rows, updates each in-place | returns updated row count | materializing |
+| `PhysicalDelete` | consumes all input rows, deletes each | returns deleted row count | materializing |
+| `PhysicalSort` | materializes **all** input rows into a buffer, sorts in-memory | returns from sorted buffer | materializing |
+| `PhysicalAggregate` | consumes **all** input rows into a group hash map | returns from materialized result set | materializing |
+| `PhysicalDistinct` | consumes all rows, deduplicates via hash set | returns from unique-row buffer | materializing |
+
+**Streaming** operators process one row at a time (constant extra memory). **Materializing** operators must consume their entire input before returning any output — Sort, Aggregate, and Distinct each buffer all rows in-memory.
+
+---
+
+### Logical → Physical Transformation
+
+The optimizer's `Optimize(plan)` is a recursive `switch` over logical node types. The key optimization occurs in `optimizeFilter` ([query/optimizer.go:79](query/optimizer.go#L79)):
+
+```
+LogicalFilter(col op literal)
+  └─ LogicalScan(table)
+```
+
+The optimizer checks whether `table` has an index on `col`. If so, it replaces the entire Scan+Filter pair with a single `PhysicalIndexScan` — the filter is pushed down into the index:
+
+```go
+// optimizer.go: tryIndexScan()
+if table.HasIndex(colRef.Name) {
+    val, _ := o.evalLiteral(cmp.Right)
+    return NewPhysicalIndexScanExact(table, colRef.Name, val)  // replaces Scan+Filter
+}
+```
+
+Four index patterns are recognised: exact match (`=`), lower-bound range (`>`, `>=`), upper-bound range (`<`, `<=`), and double-sided range (`col >= X AND col <= Y`). Any other predicate shape falls back to `PhysicalTableScan` + `PhysicalFilter`.
+
+The optimizer also resolves column **names → indices** during transformation, so physical operators work with integer array positions rather than string lookups at runtime.
+
+**Full pipeline for** `SELECT * FROM products WHERE price > 50.5 ORDER BY price DESC LIMIT 5`:
+
+```
+SQL string
+  ↓ parser.ParseString()
+SelectStmt (AST)
+  ↓ Planner.planSelect()
+LogicalLimit(5)
+  └─ LogicalSort([price DESC])
+       └─ LogicalProjection([*])
+            └─ LogicalFilter(price > 50.5)
+                 └─ LogicalScan(products)
+  ↓ Optimizer.Optimize()
+PhysicalLimit(5)
+  └─ PhysicalSort([colIdx=4, DESC])      ← name resolved to index
+       └─ PhysicalProjection([cols 0..N])
+            └─ PhysicalIndexScanRange(products, "price", lo=50.5)
+                                          ← Scan+Filter replaced if index exists;
+                                             otherwise PhysicalTableScan+PhysicalFilter
+  ↓ Engine: Open() → loop Next() → Close()
+ResultSet
+```
 
 ---
 

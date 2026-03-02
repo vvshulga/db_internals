@@ -281,6 +281,16 @@ func exprToValue(col storage.Column, expr parser.Expr) (storage.Value, error) {
 			return storage.Value{}, fmt.Errorf("cannot assign int literal to %v", col.Type)
 		}
 
+	case *parser.LiteralFloat:
+		switch col.Type {
+		case storage.TypeFLOAT:
+			return storage.NewFloatValue(float32(e.Value)), nil
+		case storage.TypeDOUBLE:
+			return storage.NewDoubleValue(e.Value), nil
+		default:
+			return storage.Value{}, fmt.Errorf("cannot assign float literal to %v", col.Type)
+		}
+
 	case *parser.LiteralString:
 		log.Printf("DEBUG: Converting string %q to column type %v", e.Value, col.Type)
 		switch col.Type {
