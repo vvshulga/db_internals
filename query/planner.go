@@ -251,6 +251,29 @@ func (p *Planner) buildAggregate(items []parser.ProjectionItem, groupByColumns [
 		}
 	}
 
+	// Ensure every column in the GROUP BY clause drives the grouping, even if it
+	// was not selected.  SQL allows: SELECT AVG(x) FROM t GROUP BY y — here y
+	// is used for grouping but not emitted in the output we build below.
+	// We include it in the output so the physical aggregate can materialize it;
+	// callers that want to hide it can wrap with a projection.
+	for _, gbCol := range groupByColumns {
+		alreadyAdded := false
+		for _, c := range groupByCols {
+			if c == gbCol {
+				alreadyAdded = true
+				break
+			}
+		}
+		if !alreadyAdded {
+			idx, ok := inputSchema.ColumnIndex(gbCol)
+			if !ok {
+				return nil, &ErrUnknownColumn{Name: gbCol}
+			}
+			groupByCols = append(groupByCols, gbCol)
+			outputCols = append(outputCols, inputSchema.Column(idx))
+		}
+	}
+
 	// Reorder output columns: group-by columns first, then aggregates
 	// This matches SQL convention and makes result interpretation easier
 	finalOutputCols := make([]storage.Column, 0, len(outputCols))
